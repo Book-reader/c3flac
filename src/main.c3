@@ -7,6 +7,9 @@ fn int main(String[] args)
 	FlacDecoder f = flac::open(tmem, args[1])!!;
 	defer (void)f.close();
 
+	//char[1024] buf;
+	//f.read(&buf)!!;
+
 	//UIntBE format_spec = {io::read_be_uint(&audio_file)!!};
 	//assert(format_spec == (UIntBE){'fLaC'}); // 0x664C6143
 	return 0;
@@ -14,8 +17,11 @@ fn int main(String[] args)
 
 module flac;
 import std::io;
+import std::math;
 
 faultdef NON_AUDIO_FLAC_UNSUPPORTED, UNSUPPORTED_METADATA_TYPE, BAD_FLAC, BAD_FLAC_MAGIC;//, BAD_FLAC_METADATA_HEADER;
+
+enum TriBool : char {UNKNOWN, FALSE, TRUE}
 
 struct FlacDecoder (InStream)
 {
@@ -23,6 +29,7 @@ struct FlacDecoder (InStream)
 	File* file; // TODO: support reading from any InStream?
 	FlacStreamInfo flac_info;
 	SeekPoint[] seek_points;
+	bool variable_block_size;
 }
 
 fn FlacDecoder? open(Allocator alloc, String file)
@@ -59,7 +66,9 @@ fn FlacDecoder? open(Allocator alloc, String file)
 	if (flac_info.sample_rate == 0) return NON_AUDIO_FLAC_UNSUPPORTED~;
 	if (flac_info.min_block_size < 16 || flac_info.max_block_size > 65535 || flac_info.min_block_size > flac_info.max_block_size) return BAD_FLAC~;
 	if (flac_info.bits_per_sample < 4 || flac_info.bits_per_sample > 32) return BAD_FLAC~;
-	//flac_info.min_block_size = (info_bytes[0] << 16u) | (info_bytes[1] << 8u) | info_bytes[2];
+
+	decoder.flac_info = flac_info;
+	decoder.variable_block_size = flac_info.min_block_size != flac_info.max_block_size;
 
 	io::printn(flac_info);
 
@@ -95,23 +104,74 @@ fn FlacDecoder? open(Allocator alloc, String file)
 			case FORBIDDEN: return BAD_FLAC~;
 		}
 	}
-	/*io::read_any(&flac_file, &flac_info) ?? BAD_FLAC~!;
-	io::printn(flac_info);
-	io::printfn("%s %s", flac_info.min_frame_size, flac_info.max_frame_size);*/
-	/*flac_info.min_block_size = io::read_be_ushort(&flac_file) ?? BAD_FLAC~;
-	flac_info.max_block_size = io::read_be_ushort(&flac_file) ?? BAD_FLAC~;
-	flac_info.min_block_size = io::read_be_ushort(&flac_file) ?? BAD_FLAC~;
-*/
-	//decoder.flac_info = flac_info;
 
-	/*io::read_be_uint(&flac_file)!!;
-	io::read_be_uint(&flac_file)!!;
-	char hi_byte =  flac_file.read_byte()!!;
-	char mid_byte = flac_file.read_byte()!!;
-	char lo_byte =  flac_file.read_byte()!!;
-	io::printn((hi_byte << 16) | (mid_byte << 8) | lo_byte);*/
+	decode_frame_header(&decoder)!!;
 
 	return decoder;
+}
+
+const ushort SYNC_CODE @private = 0b111111111111100;
+const uint[0xF] SAMPLE_RATE_TABLE =
+{
+	[0x0] = uint::max,
+	[0xC..0xE] = uint::max,
+	[0x1] = 88_200,  // 88.2  kHz
+	[0x2] = 176_400, // 176.4 kHz
+	[0x3] = 192_000, // 192   kHz
+	[0x4] = 8_000,   // 8     kHz
+	[0x5] = 16_000,  // 16    kHz
+	[0x6] = 22_050,  // 22.05 kHz
+	[0x7] = 24_000,  // 24    kHz
+	[0x8] = 32_000,  // 32    kHz
+	[0x9] = 44_100,  // 44.1  kHz
+	[0xA] = 48_000,  // 48    kHz
+	[0xB] = 96_000,  // 96    kHz
+};
+
+fn void? decode_frame_header(FlacDecoder* self) @private
+{
+	io::printn("Decoding frame header");
+	FlacFrameHeaderFirstPart header_part_1;
+	io::read_any(self.file, &header_part_1)!;
+	if (@unlikely(header_part_1.sync_code != SYNC_CODE)) return BAD_FLAC~; // TODO: have a feature flag to disable some runtime validity checking.
+	if (@unlikely(header_part_1.variable_block_size != self.variable_block_size)) return BAD_FLAC~;
+	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC~;
+
+	FlacFrameBlockSizeType block_size_type; // if it's uncommon the stored value after the coded value is the real value - 1
+	ushort block_size @noinit;
+	switch (char block_size_bits = header_part_1.block_size_bits)
+	{
+		case 0b0000        : return BAD_FLAC~;
+		case 0b0001        : block_size = 192;
+		case 0b0010..0b0101: block_size = 144 * (1 << block_size_bits);/*(ushort)math::pow(2, block_size_bits)*/ // TODO: check if this gets constant folded
+		case 0b0110        : block_size_type = UNCOMMON_8;
+		case 0b0111        : block_size_type = UNCOMMON_16;
+		case 0b1000..0b1111: block_size = 1 << block_size_bits;/*(ushort)math::pow(2, block_size_bits)*/ // TODO: same as above
+		default            : unreachable();
+	}
+
+	FlacFrameSampleRateType sample_rate_type;
+	uint sample_rate_hz @noinit;
+
+	switch (char sample_rate_bits = header_part_1.sample_rate_bits)
+	{
+		case 0b0000        : sample_rate_type = ONLY_STORED_IN_STREAMINFO;
+		case 0b0001..0b1011: sample_rate_hz = SAMPLE_RATE_TABLE[sample_rate_bits];
+		case 0b1100        : sample_rate_type = UNCOMMON_KHZ_8;
+		case 0b1101        : sample_rate_type = UNCOMMON_HZ_16;
+		case 0b1110        : sample_rate_type = UNCOMMON_HZ_16_DIV10;
+		case 0b1111        : return BAD_FLAC~;
+		default            : unreachable();
+	}
+
+	if (header_part_1.channel_bits >= FlacFrameChannels::values.len) return BAD_FLAC~; // reserved values
+	FlacFrameChannels channels = FlacFrameChannels::from_ordinal(header_part_1.channel_bits);
+
+	FlacFrameBitDepth bit_depth = FlacFrameBitDepth::from_ordinal(header_part_1.bit_depth_bits);
+	if (bit_depth == RESERVED) return BAD_FLAC~;
+
+	io::printfn("block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
+
 }
 
 fn void? FlacDecoder.close(&self) @dynamic
@@ -143,6 +203,34 @@ constdef FlacMetadataHeaderType : char @private
 	FORBIDDEN = 127,
 }
 
+enum FlacFrameBlockSizeType  : char @private {COMMON, UNCOMMON_8, UNCOMMON_16}
+enum FlacFrameSampleRateType : char @private {COMMON, ONLY_STORED_IN_STREAMINFO, UNCOMMON_KHZ_8, UNCOMMON_HZ_16, UNCOMMON_HZ_16_DIV10}
+enum FlacFrameChannels    : char @private
+{
+	MONO,
+	STEREO,
+	THREE,
+	FOUR,
+	FIVE,
+	SIX,
+	SEVEN,
+	EIGHT,
+	STEREO_LEFT_SIDE,
+	STEREO_RIGHT_SIDE,
+	STEREO_MID_SIDE,
+}
+enum FlacFrameBitDepth : char @private
+{
+	ONLY_STORED_IN_STREAMINFO,
+	BPS_8,
+	BPS_12,
+	RESERVED,
+	BPS_16,
+	BPS_20,
+	BPS_24,
+	BPS_32,
+}
+
 bitstruct FlacMetadataHeader : uint @bigendian @private
 {
 	bool last : 31;
@@ -168,4 +256,15 @@ struct SeekPoint @private
 	ulong sample_number;
 	ulong offset;
 	ushort num_samples;
+}
+
+bitstruct FlacFrameHeaderFirstPart : uint/*char[4]*/ @bigendian @private
+{
+	ushort sync_code           : 17..31/*0..14*/;
+	bool   variable_block_size : 16/*15*/;
+	char   block_size_bits     : 12..15/*16..19*/;
+	char   sample_rate_bits    : 8..11/*20..23*/;
+	char   channel_bits        : 4..7/*24..27*/;
+	char   bit_depth_bits      : 1..3/*28..30*/;
+	char   reserved_bit        : 0..0/*31*/; // MUST be 0
 }
