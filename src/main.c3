@@ -22,6 +22,7 @@ struct FlacDecoder (InStream)
 	Allocator alloc;
 	File* file; // TODO: support reading from any InStream?
 	FlacStreamInfo flac_info;
+	SeekPoint[] seek_points;
 }
 
 fn FlacDecoder? open(Allocator alloc, String file)
@@ -62,6 +63,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 
 	io::printn(flac_info);
 
+	bool has_seek_table = false;
 	while (!header.last)
 	{
 		io::read_any(decoder.file, &header) ?? BAD_FLAC~!;
@@ -77,9 +79,17 @@ fn FlacDecoder? open(Allocator alloc, String file)
 			case SEEK_TABLE:
 				const SEEK_POINT_SIZE = 18;
 				if (header.size % SEEK_POINT_SIZE != 0) return BAD_FLAC~;
+				if (has_seek_table) return BAD_FLAC~; // can only have one seek table
+				has_seek_table = true;
 				sz num_seek_points = header.size / SEEK_POINT_SIZE;
-				log::warn("TODO: handle seek tables");
-				nextcase PADDING;
+				SeekPoint[] seek_points = alloc::alloc_array(alloc, SeekPoint, num_seek_points);
+				foreach (&seek_point : seek_points)
+				{
+					seek_point.sample_number = io::read_be_ulong(decoder.file)  ?? BAD_FLAC~!;
+					seek_point.offset        = io::read_be_ulong(decoder.file)  ?? BAD_FLAC~!;
+					seek_point.num_samples   = io::read_be_ushort(decoder.file) ?? BAD_FLAC~!;
+				}
+				decoder.seek_points = seek_points;
 			default:
 			case STREAM_INFO:
 			case FORBIDDEN: return BAD_FLAC~;
@@ -120,7 +130,7 @@ fn char? FlacDecoder.read_byte(&self) @dynamic
 	return io::UNSUPPORTED_OPERATION~;
 }
 
-constdef FlacMetadataHeaderType : char
+constdef FlacMetadataHeaderType : char @private
 {
 	STREAM_INFO,
 	PADDING,
@@ -140,33 +150,6 @@ bitstruct FlacMetadataHeader : uint @bigendian @private
 	uint size : 0..23;
 }
 
-//$assert FlacStreamInfo::size == 34;
-/*struct FlacStreamInfo @packed// : char[34] @private
-{
-	UShortBE  min_block_size/*  : 0..15*/;    // measured in samples, MUST be in the range 16-65535. All frames but the last MUST be >= min_block_size, all MUST be <= max_block_size
-	UShortBE  max_block_size/*  : 16..31*/;   // ^
-	union @packed
-	{
-		bitstruct : ulong @bigendian
-		{
-			uint min_frame_size : 0..23;
-			uint max_frame_size : 24..47;
-		}
-		struct @packed
-		{
-			char[6] _padding0;
-			//bitstruct : 
-		}
-	}
-	/*UIntBE    min_frame_size  : 32..55;   // measured in bytes, 0 means not known.
-	UIntBE    max_frame_size  : 56..79;   // ^*/
-	UIntBE    sample_rate     /*: 80..99*/;   // in Hz. MUST not be 0 when the flac contains audio, but MAY be 0 when containing non-audio data.
-	char      num_channels    /*: 100..102*/; // number of channels minus 1, 1 to 8 channels are supported.
-	char      bits_per_sample /*: 103..107*/; // bits per sample minus 1, 4 to 32 bits are supported.
-	ULongBE   total_samples   /*: 108..143*/; // number of interchannel samples in stream, 0 means not known.
-	UInt128BE md5_checksum    /*: 144..271*/; // checksum of unencoded audio, 0 means not known.
-}*/
-
 struct FlacStreamInfo @private
 {
 	ushort  min_block_size;         // measured in samples, MUST be in the range 16-65535. All frames but the last MUST be >= min_block_size, all MUST be <= max_block_size
@@ -180,15 +163,9 @@ struct FlacStreamInfo @private
 	uint128 md5_checksum;           // checksum of unencoded audio, 0 means not known.
 }
 
-/*bitstruct FlacStreamInfo : char[34] @bigendian @private
+struct SeekPoint @private
 {
-	ushort  min_block_size  : 0..15;    // measured in samples, MUST be in the range 16-65535. All frames but the last MUST be >= min_block_size, all MUST be <= max_block_size
-	ushort  max_block_size  : 16..31;   // ^
-	uint    min_frame_size  : 32..55;   // measured in bytes, 0 means not known.
-	uint    max_frame_size  : 56..79;   // ^
-	uint    sample_rate     : 80..99;   // in Hz. MUST not be 0 when the flac contains audio, but MAY be 0 when containing non-audio data.
-	char      num_channels    : 100..102; // number of channels minus 1, 1 to 8 channels are supported.
-	char      bits_per_sample : 103..107; // bits per sample minus 1, 4 to 32 bits are supported.
-	ulong   total_samples   : 108..143; // number of interchannel samples in stream, 0 means not known.
-	uint128 md5_checksum    : 144..271; // checksum of unencoded audio, 0 means not known.
-}*/
+	ulong sample_number;
+	ulong offset;
+	ushort num_samples;
+}
