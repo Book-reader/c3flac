@@ -109,7 +109,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 
 	decode_frame_header(&decoder)!!;
 	//for (int i = 0; i < 20; i++) // find & decode more frame headers
-	while (true)
+	/*while (true)
 	{
 		char prev_byte = decoder.file.read_byte()!!;
 		while (true)
@@ -124,7 +124,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		decoder.file.seek(-2, FROM_CURSOR)!!; // seek back to the start of the header part
 		io::printf("Scanned to what seems to be a frame header, ");
 		decode_frame_header(&decoder)!!; // decode the next frame header
-	}
+	}*/
 
 	return decoder;
 }
@@ -192,8 +192,29 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 
 	if (self.variable_block_size) abort("Handling the coded number with variable block sizes is not implemented yet");
 	long frame_number = decode_coded_number(self)!;
+	// NOTE: don't rely on these coded numbers for seeking, but do validate them
 	if (frame_number != self.prev_frame_number + 1) return BAD_FLAC~;
 	self.prev_frame_number = frame_number;
+
+	switch (block_size_type)
+	{
+		case COMMON: break;
+		case UNCOMMON_8: block_size = self.file.read_byte()! + 1;
+		case UNCOMMON_16:
+			ushort bs = io::read_be_ushort(self.file)!;
+			if (bs == ushort::max) return BAD_FLAC~;
+			block_size = bs + 1;
+	}
+
+	switch (sample_rate_type)
+	{
+		case COMMON: break;
+		case ONLY_STORED_IN_STREAMINFO: sample_rate_hz = self.flac_info.sample_rate;
+		case UNCOMMON_KHZ_8: sample_rate_hz = (ushort)self.file.read_byte()! * 1000;
+		case UNCOMMON_HZ_16: sample_rate_hz = io::read_be_ushort(self.file)!;
+		case UNCOMMON_HZ_16_DIV10: sample_rate_hz = io::read_be_ushort(self.file)! * 10;
+	}
+
 	io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
 }
 
