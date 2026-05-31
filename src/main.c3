@@ -19,7 +19,7 @@ module flac;
 import std::io;
 import std::math;
 
-faultdef NON_AUDIO_FLAC_UNSUPPORTED, UNSUPPORTED_METADATA_TYPE, BAD_FLAC, BAD_FLAC_MAGIC;//, BAD_FLAC_METADATA_HEADER;
+faultdef NON_AUDIO_FLAC_UNSUPPORTED, UNSUPPORTED_METADATA_TYPE, BAD_FLAC, BAD_FLAC_FRAME_HEADER, BAD_CODED_NUMBER, BAD_FLAC_MAGIC;//, BAD_FLAC_METADATA_HEADER;
 
 enum TriBool : char {UNKNOWN, FALSE, TRUE}
 
@@ -153,15 +153,15 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	FlacFrameHeaderFirstPart header_part_1;
 	io::read_any(self.file, &header_part_1)!;
 	//io::printfn("header pt 1 %.32b", ((UIntBE)(uint)header_part_1).val);
-	if (@unlikely(header_part_1.sync_code != SYNC_CODE)) return BAD_FLAC~; // TODO: have a feature flag to disable some runtime validity checking.
-	if (@unlikely(header_part_1.variable_block_size != self.variable_block_size)) return BAD_FLAC~;
-	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC~;
+	if (@unlikely(header_part_1.sync_code != SYNC_CODE)) return BAD_FLAC_FRAME_HEADER~; // TODO: have a feature flag to disable some runtime validity checking.
+	if (@unlikely(header_part_1.variable_block_size != self.variable_block_size)) return BAD_FLAC_FRAME_HEADER~;
+	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC_FRAME_HEADER~;
 
 	FlacFrameBlockSizeType block_size_type; // if it's uncommon the stored value after the coded value is the real value - 1
 	ushort block_size /*@noinit*/; // TODO: add back @noninit when I really care about performance
 	switch (char block_size_bits = header_part_1.block_size_bits)
 	{
-		case 0b0000        : return BAD_FLAC~;
+		case 0b0000        : return BAD_FLAC_FRAME_HEADER~;
 		case 0b0001        : block_size = 192;
 		case 0b0010..0b0101: block_size = 144 * (1 << block_size_bits);/*(ushort)math::pow(2, block_size_bits)*/ // TODO: check if this gets constant folded
 		case 0b0110        : block_size_type = UNCOMMON_8;
@@ -180,20 +180,20 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 		case 0b1100        : sample_rate_type = UNCOMMON_KHZ_8;
 		case 0b1101        : sample_rate_type = UNCOMMON_HZ_16;
 		case 0b1110        : sample_rate_type = UNCOMMON_HZ_16_DIV10;
-		case 0b1111        : return BAD_FLAC~;
+		case 0b1111        : return BAD_FLAC_FRAME_HEADER~;
 		default            : unreachable();
 	}
 
-	if (header_part_1.channel_bits >= FlacFrameChannels::values.len) return BAD_FLAC~; // reserved values
+	if (header_part_1.channel_bits >= FlacFrameChannels::values.len) return BAD_FLAC_FRAME_HEADER~; // reserved values
 	FlacFrameChannels channels = FlacFrameChannels::from_ordinal(header_part_1.channel_bits);
 
 	FlacFrameBitDepth bit_depth = FlacFrameBitDepth::from_ordinal(header_part_1.bit_depth_bits);
-	if (bit_depth == RESERVED) return BAD_FLAC~;
+	if (bit_depth == RESERVED) return BAD_FLAC_FRAME_HEADER~;
 
 	if (self.variable_block_size) abort("Handling the coded number with variable block sizes is not implemented yet");
 	long frame_number = decode_coded_number(self)!;
 	// NOTE: don't rely on these coded numbers for seeking, but do validate them
-	if (frame_number != self.prev_frame_number + 1) return BAD_FLAC~;
+	if (frame_number != self.prev_frame_number + 1) return BAD_FLAC_FRAME_HEADER~;
 	self.prev_frame_number = frame_number;
 
 	switch (block_size_type)
@@ -202,7 +202,7 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 		case UNCOMMON_8: block_size = self.file.read_byte()! + 1;
 		case UNCOMMON_16:
 			ushort bs = io::read_be_ushort(self.file)!;
-			if (bs == ushort::max) return BAD_FLAC~;
+			if (bs == ushort::max) return BAD_FLAC_FRAME_HEADER~;
 			block_size = bs + 1;
 	}
 
@@ -214,6 +214,8 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 		case UNCOMMON_HZ_16: sample_rate_hz = io::read_be_ushort(self.file)!;
 		case UNCOMMON_HZ_16_DIV10: sample_rate_hz = io::read_be_ushort(self.file)! * 10;
 	}
+
+	char crc = self.file.read_byte()!; // TODO: handle?
 
 	io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
 }
@@ -250,7 +252,7 @@ fn long? decode_coded_number(FlacDecoder* self) @private
 			long fourth = read_coded_tail_byte(self)!;
 			long fifth = read_coded_tail_byte(self)!;
 			long sixth = read_coded_tail_byte(self)!;
-			coded_number = (((first & 1) << 30) | (second << 24) | (third << 18) | (fourth << 12) | (fifth << 6) | sixth) + 1;
+			coded_number = (((first & 0x01) << 30) | (second << 24) | (third << 18) | (fourth << 12) | (fifth << 6) | sixth) + 1;
 		case 0xFE:
 			long second = read_coded_tail_byte(self)!;
 			long third = read_coded_tail_byte(self)!;
@@ -259,7 +261,7 @@ fn long? decode_coded_number(FlacDecoder* self) @private
 			long sixth = read_coded_tail_byte(self)!;
 			long seventh = read_coded_tail_byte(self)!;
 			coded_number = ((second << 30) | (third << 24) | (fourth << 18) | (fifth << 12) | (sixth << 6) | seventh) + 1;
-		default: return BAD_FLAC~;
+		default: return BAD_CODED_NUMBER~;
 	}
 	return coded_number;
 }
@@ -267,11 +269,16 @@ fn long? decode_coded_number(FlacDecoder* self) @private
 fn char? read_coded_tail_byte(FlacDecoder* self) @inline
 {
 	char b = self.file.read_byte()!;
-	if (@unlikely(!is_valid_coded_tail_byte(b))) return BAD_FLAC~;
+	if (@unlikely(!is_valid_coded_tail_byte(b))) return BAD_CODED_NUMBER~;
 	return b & (char)~0xC0;
 }
 
 macro bool is_valid_coded_tail_byte(char c) @private => c & 0xC0 == 0x80; // byte must start with 0b10
+
+fn void? decode_subframe_header(FlacDecoder* self) @private
+{
+	
+}
 
 fn void? FlacDecoder.close(&self) @dynamic
 {
@@ -304,19 +311,19 @@ constdef FlacMetadataHeaderType : char @private
 
 enum FlacFrameBlockSizeType  : char @private {COMMON, UNCOMMON_8, UNCOMMON_16}
 enum FlacFrameSampleRateType : char @private {COMMON, ONLY_STORED_IN_STREAMINFO, UNCOMMON_KHZ_8, UNCOMMON_HZ_16, UNCOMMON_HZ_16_DIV10}
-enum FlacFrameChannels    : char @private
+enum FlacFrameChannels : char (char num_channels) @private
 {
-	MONO,
-	STEREO,
-	THREE,
-	FOUR,
-	FIVE,
-	SIX,
-	SEVEN,
-	EIGHT,
-	STEREO_LEFT_SIDE,
-	STEREO_RIGHT_SIDE,
-	STEREO_MID_SIDE,
+	MONO {1},
+	STEREO {2},
+	THREE {3},
+	FOUR {4},
+	FIVE {5},
+	SIX {6},
+	SEVEN {7},
+	EIGHT {8},
+	STEREO_LEFT_SIDE {2},
+	STEREO_RIGHT_SIDE {2},
+	STEREO_MID_SIDE {2},
 }
 enum FlacFrameBitDepth : char @private
 {
