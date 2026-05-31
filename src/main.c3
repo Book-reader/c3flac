@@ -30,12 +30,14 @@ struct FlacDecoder (InStream)
 	FlacStreamInfo flac_info;
 	SeekPoint[] seek_points;
 	bool variable_block_size;
+	long prev_frame_number;
 }
 
 fn FlacDecoder? open(Allocator alloc, String file)
 {
 	io::printn(file);
 	File flac_file = file::open(file, "rb")!;
+
 	uint magic = io::read_be_uint(&flac_file) ?? BAD_FLAC~!;
 	if (magic != 'fLaC') return BAD_FLAC_MAGIC~;
 
@@ -106,6 +108,23 @@ fn FlacDecoder? open(Allocator alloc, String file)
 	}
 
 	decode_frame_header(&decoder)!!;
+	//for (int i = 0; i < 20; i++) // find & decode more frame headers
+	while (true)
+	{
+		char prev_byte = decoder.file.read_byte()!!;
+		while (true)
+		{
+			char next_byte = decoder.file.read_byte()!!;
+			char third_byte = decoder.file.read_byte()!!;
+			char fourth_byte = decoder.file.read_byte()!!;
+			decoder.file.seek(-2, FROM_CURSOR)!!;
+			if (prev_byte == 0xFF && next_byte == (0xF8 | (char)decoder.variable_block_size) && (third_byte >> 4u) != 0 && fourth_byte & 0x01 == 0) break;
+			prev_byte = next_byte;
+		}
+		decoder.file.seek(-2, FROM_CURSOR)!!; // seek back to the start of the header part
+		io::printf("Scanned to what seems to be a frame header, ");
+		decode_frame_header(&decoder)!!; // decode the next frame header
+	}
 
 	return decoder;
 }
@@ -133,12 +152,13 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	io::printn("Decoding frame header");
 	FlacFrameHeaderFirstPart header_part_1;
 	io::read_any(self.file, &header_part_1)!;
+	//io::printfn("header pt 1 %.32b", ((UIntBE)(uint)header_part_1).val);
 	if (@unlikely(header_part_1.sync_code != SYNC_CODE)) return BAD_FLAC~; // TODO: have a feature flag to disable some runtime validity checking.
 	if (@unlikely(header_part_1.variable_block_size != self.variable_block_size)) return BAD_FLAC~;
 	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC~;
 
 	FlacFrameBlockSizeType block_size_type; // if it's uncommon the stored value after the coded value is the real value - 1
-	ushort block_size @noinit;
+	ushort block_size /*@noinit*/; // TODO: add back @noninit when I really care about performance
 	switch (char block_size_bits = header_part_1.block_size_bits)
 	{
 		case 0b0000        : return BAD_FLAC~;
@@ -151,7 +171,7 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	}
 
 	FlacFrameSampleRateType sample_rate_type;
-	uint sample_rate_hz @noinit;
+	uint sample_rate_hz /*@noinit*/;
 
 	switch (char sample_rate_bits = header_part_1.sample_rate_bits)
 	{
@@ -170,9 +190,67 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	FlacFrameBitDepth bit_depth = FlacFrameBitDepth::from_ordinal(header_part_1.bit_depth_bits);
 	if (bit_depth == RESERVED) return BAD_FLAC~;
 
-	io::printfn("block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
-
+	if (self.variable_block_size) abort("Handling the coded number with variable block sizes is not implemented yet");
+	long frame_number = decode_coded_number(self)!;
+	if (frame_number != self.prev_frame_number + 1) return BAD_FLAC~;
+	self.prev_frame_number = frame_number;
+	io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
 }
+
+// If it's a fixed block size stream this is a frame number, if it's a variable block size stream this is the sample number of the first sample in the frame
+fn long? decode_coded_number(FlacDecoder* self) @private
+{
+	long coded_number /*@noinit*/ = -1; // -1 temporarily for testing to detect invalid value (max value cannot be over 2^36, 2^31 when encoding a frame number)
+	// https://www.rfc-editor.org/rfc/rfc9639.html#section-9.1.5
+	switch (long first = self.file.read_byte()!, (char)first)
+	{
+		case 0x00..0x7F: coded_number = (first & (char)(~0x80)) + 1;
+		case 0xC0..0xDF:
+			long second = read_coded_tail_byte(self)!;
+			coded_number = (((first & 0x1F) << 6) | second) + 1;
+		case 0xE0..0xEF:
+			long second = read_coded_tail_byte(self)!;
+			long third = read_coded_tail_byte(self)!;
+			coded_number = (((first & 0x0F) << 12) | (second << 6) | third) + 1;
+		case 0xF0..0xF7:
+			long second = read_coded_tail_byte(self)!;
+			long third = read_coded_tail_byte(self)!;
+			long fourth = read_coded_tail_byte(self)!;
+			coded_number = (((first & 0x07) << 18) | (second << 12) | (third << 6) | fourth) + 1;
+		case 0xF8..0xFB:
+			long second = read_coded_tail_byte(self)!;
+			long third = read_coded_tail_byte(self)!;
+			long fourth = read_coded_tail_byte(self)!;
+			long fifth = read_coded_tail_byte(self)!;
+			coded_number = (((first & 0x03) << 24) | (second << 18) | (third << 12) | (fourth << 6) | fifth) + 1;
+		case 0xFC..0xFD:
+			long second = read_coded_tail_byte(self)!;
+			long third = read_coded_tail_byte(self)!;
+			long fourth = read_coded_tail_byte(self)!;
+			long fifth = read_coded_tail_byte(self)!;
+			long sixth = read_coded_tail_byte(self)!;
+			coded_number = (((first & 1) << 30) | (second << 24) | (third << 18) | (fourth << 12) | (fifth << 6) | sixth) + 1;
+		case 0xFE:
+			long second = read_coded_tail_byte(self)!;
+			long third = read_coded_tail_byte(self)!;
+			long fourth = read_coded_tail_byte(self)!;
+			long fifth = read_coded_tail_byte(self)!;
+			long sixth = read_coded_tail_byte(self)!;
+			long seventh = read_coded_tail_byte(self)!;
+			coded_number = ((second << 30) | (third << 24) | (fourth << 18) | (fifth << 12) | (sixth << 6) | seventh) + 1;
+		default: return BAD_FLAC~;
+	}
+	return coded_number;
+}
+
+fn char? read_coded_tail_byte(FlacDecoder* self) @inline
+{
+	char b = self.file.read_byte()!;
+	if (@unlikely(!is_valid_coded_tail_byte(b))) return BAD_FLAC~;
+	return b & (char)~0xC0;
+}
+
+macro bool is_valid_coded_tail_byte(char c) @private => c & 0xC0 == 0x80; // byte must start with 0b10
 
 fn void? FlacDecoder.close(&self) @dynamic
 {
