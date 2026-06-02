@@ -19,7 +19,16 @@ module flac;
 import std::io;
 import std::math;
 
-faultdef NON_AUDIO_FLAC_UNSUPPORTED, UNSUPPORTED_METADATA_TYPE, BAD_FLAC, BAD_FLAC_FRAME_HEADER, BAD_CODED_NUMBER, BAD_FLAC_MAGIC;//, BAD_FLAC_METADATA_HEADER;
+faultdef
+	NON_AUDIO_FLAC_UNSUPPORTED,
+	UNSUPPORTED_METADATA_TYPE,
+	BAD_FLAC,
+	BAD_FLAC_FRAME_HEADER,
+	BAD_FLAC_SUBFRAME_HEADER,
+	BAD_CODED_NUMBER,
+	BAD_FLAC_MAGIC,
+	// BAD_FLAC_METADATA_HEADER,
+;
 
 enum TriBool : char {UNKNOWN, FALSE, TRUE}
 
@@ -27,6 +36,7 @@ struct FlacDecoder (InStream)
 {
 	Allocator alloc;
 	File* file; // TODO: support reading from any InStream?
+	BitReader bit_reader;
 	FlacStreamInfo flac_info;
 	SeekPoint[] seek_points;
 	bool variable_block_size;
@@ -44,6 +54,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 	FlacDecoder decoder;
 	decoder.alloc = alloc;
 	decoder.file = alloc::clone(alloc, flac_file);
+	decoder.bit_reader.init(decoder.file);
 
 	const STREAM_INFO_SIZE = 34;
 	FlacMetadataHeader header;
@@ -108,6 +119,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 	}
 
 	decode_frame_header(&decoder)!!;
+	decode_subframe_header(&decoder)!!;
 	//for (int i = 0; i < 20; i++) // find & decode more frame headers
 	/*while (true)
 	{
@@ -147,8 +159,11 @@ const uint[0xF] SAMPLE_RATE_TABLE =
 	[0xB] = 96_000,  // 96    kHz
 };
 
+// This will always start and end at a byte boundary so the file can be read from directly
 fn void? decode_frame_header(FlacDecoder* self) @private
 {
+	self.bit_reader.clear();
+
 	io::printn("Decoding frame header");
 	FlacFrameHeaderFirstPart header_part_1;
 	io::read_any(self.file, &header_part_1)!;
@@ -275,9 +290,38 @@ fn char? read_coded_tail_byte(FlacDecoder* self) @inline
 
 macro bool is_valid_coded_tail_byte(char c) @private => c & 0xC0 == 0x80; // byte must start with 0b10
 
+// A subframe header is not guaranteed to be byte aligned unless it is the first after a frame header so it needs to use the bit reader
+// I need to make sure the bit reader is properly reset after using the regular file reader with something that is guaranteed to be byte aligned so it doesn't re-use old data stored when it was last used
 fn void? decode_subframe_header(FlacDecoder* self) @private
 {
-	
+	// TODO: compact these first 3 read_bits calls into a single read_bits(8) call and do the rest of the bit stuff manually, it should improve performance
+	if (@unlikely(self.bit_reader.read_bits(1)! != 0)) return BAD_FLAC_SUBFRAME_HEADER~;
+	char predictor_order /*@noinit*/; // TODO: make @noninit when more tested
+	FlacSubframeType subframe_type @noinit;
+	switch (char v = self.bit_reader.read_bits(6)!)
+	{
+		case 0x00: subframe_type = CONSTANT;
+		case 0x01: subframe_type = VERBATIM;
+		case 0x0D..0x1F:
+		case 0x02..0x07: return BAD_FLAC_SUBFRAME_HEADER~;
+		case 0x08..0x0C:
+			subframe_type = FIXED_PREDICTOR;
+			predictor_order = v - 8;
+		case 0x20..0x3F:
+			subframe_type = LINEAR_PREDICTOR;
+			predictor_order = v - 31;
+		default: unreachable();
+	}
+	bool has_wasted_bits = (bool)(self.bit_reader.read_bits(1)!);
+	int wasted_bits /*@noinit*/; // TODO: check what the max number of wasted bits is to restrict type
+	if (has_wasted_bits)
+	{
+		wasted_bits = 1;
+		while ((self.bit_reader.read_bits(1)! & (char)1) == 0) wasted_bits ++;
+	}
+
+	io::printfn("subframe type: {%s %s}, wasted bits: %s", subframe_type, predictor_order, wasted_bits);
+	if (has_wasted_bits) abort("TODO: handle wasted bits");
 }
 
 fn void? FlacDecoder.close(&self) @dynamic
@@ -335,6 +379,13 @@ enum FlacFrameBitDepth : char @private
 	BPS_20,
 	BPS_24,
 	BPS_32,
+}
+enum FlacSubframeType : char @private
+{
+	CONSTANT,
+	VERBATIM,
+	FIXED_PREDICTOR,
+	LINEAR_PREDICTOR,
 }
 
 bitstruct FlacMetadataHeader : uint @bigendian @private
