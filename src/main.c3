@@ -38,9 +38,26 @@ struct FlacDecoder (InStream)
 	File* file; // TODO: support reading from any InStream?
 	BitReader bit_reader;
 	FlacStreamInfo flac_info;
+	FlacFrameInfo current_frame;
 	SeekPoint[] seek_points;
 	bool variable_block_size;
 	long prev_frame_number;
+}
+
+struct FlacFrameInfo
+{
+	long frame_number;
+	uint sample_rate;
+	ushort block_size;
+	FlacFrameChannels channels;
+	char bit_depth;
+	char crc; // TODO: handle
+	FlacSubframeInfo[] subframes;
+}
+
+struct FlacSubframeInfo
+{
+	int todo;
 }
 
 fn FlacDecoder? open(Allocator alloc, String file)
@@ -163,6 +180,7 @@ const uint[0xF] SAMPLE_RATE_TABLE =
 fn void? decode_frame_header(FlacDecoder* self) @private
 {
 	self.bit_reader.clear();
+	FlacFrameInfo next_frame /*@noinit*/;
 
 	io::printn("Decoding frame header");
 	FlacFrameHeaderFirstPart header_part_1;
@@ -173,25 +191,23 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC_FRAME_HEADER~;
 
 	FlacFrameBlockSizeType block_size_type; // if it's uncommon the stored value after the coded value is the real value - 1
-	ushort block_size /*@noinit*/; // TODO: add back @noninit when I really care about performance
 	switch (char block_size_bits = header_part_1.block_size_bits)
 	{
 		case 0b0000        : return BAD_FLAC_FRAME_HEADER~;
-		case 0b0001        : block_size = 192;
-		case 0b0010..0b0101: block_size = 144 * (1 << block_size_bits);/*(ushort)math::pow(2, block_size_bits)*/ // TODO: check if this gets constant folded
+		case 0b0001        : next_frame.block_size = 192;
+		case 0b0010..0b0101: next_frame.block_size = 144 * (1 << block_size_bits);/*(ushort)math::pow(2, block_size_bits)*/ // TODO: check if this gets constant folded
 		case 0b0110        : block_size_type = UNCOMMON_8;
 		case 0b0111        : block_size_type = UNCOMMON_16;
-		case 0b1000..0b1111: block_size = 1 << block_size_bits;/*(ushort)math::pow(2, block_size_bits)*/ // TODO: same as above
+		case 0b1000..0b1111: next_frame.block_size = 1 << block_size_bits;/*(ushort)math::pow(2, block_size_bits)*/ // TODO: same as above
 		default            : unreachable();
 	}
 
 	FlacFrameSampleRateType sample_rate_type;
-	uint sample_rate_hz /*@noinit*/;
 
 	switch (char sample_rate_bits = header_part_1.sample_rate_bits)
 	{
 		case 0b0000        : sample_rate_type = ONLY_STORED_IN_STREAMINFO;
-		case 0b0001..0b1011: sample_rate_hz = SAMPLE_RATE_TABLE[sample_rate_bits];
+		case 0b0001..0b1011: next_frame.sample_rate = SAMPLE_RATE_TABLE[sample_rate_bits];
 		case 0b1100        : sample_rate_type = UNCOMMON_KHZ_8;
 		case 0b1101        : sample_rate_type = UNCOMMON_HZ_16;
 		case 0b1110        : sample_rate_type = UNCOMMON_HZ_16_DIV10;
@@ -200,39 +216,50 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	}
 
 	if (header_part_1.channel_bits >= FlacFrameChannels::values.len) return BAD_FLAC_FRAME_HEADER~; // reserved values
-	FlacFrameChannels channels = FlacFrameChannels::from_ordinal(header_part_1.channel_bits);
+	next_frame.channels = FlacFrameChannels::from_ordinal(header_part_1.channel_bits);
 
 	FlacFrameBitDepth bit_depth = FlacFrameBitDepth::from_ordinal(header_part_1.bit_depth_bits);
-	if (bit_depth == RESERVED) return BAD_FLAC_FRAME_HEADER~;
+	switch (bit_depth)
+	{
+		case RESERVED:
+			return BAD_FLAC_FRAME_HEADER~;
+		case ONLY_STORED_IN_STREAMINFO:
+			next_frame.bit_depth = self.flac_info.bits_per_sample;
+		default:
+			next_frame.bit_depth = (char)bit_depth.bit_depth;
+	}
 
 	if (self.variable_block_size) abort("Handling the coded number with variable block sizes is not implemented yet");
-	long frame_number = decode_coded_number(self)!;
+	next_frame.frame_number = decode_coded_number(self)!;
 	// NOTE: don't rely on these coded numbers for seeking, but do validate them
-	if (frame_number != self.prev_frame_number + 1) return BAD_FLAC_FRAME_HEADER~;
-	self.prev_frame_number = frame_number;
+	// TODO: could I maybe compare against self.current_frame.frame_number instead of using a dedicated prev_frame_number?
+	if (next_frame.frame_number != self.prev_frame_number + 1) return BAD_FLAC_FRAME_HEADER~;
+	self.prev_frame_number = next_frame.frame_number;
 
 	switch (block_size_type)
 	{
 		case COMMON: break;
-		case UNCOMMON_8: block_size = self.file.read_byte()! + 1;
+		case UNCOMMON_8: next_frame.block_size = self.file.read_byte()! + 1;
 		case UNCOMMON_16:
-			ushort bs = io::read_be_ushort(self.file)!;
-			if (bs == ushort::max) return BAD_FLAC_FRAME_HEADER~;
-			block_size = bs + 1;
+			ushort block_size = io::read_be_ushort(self.file)!;
+			if (block_size == ushort::max) return BAD_FLAC_FRAME_HEADER~;
+			next_frame.block_size = block_size + 1;
 	}
 
 	switch (sample_rate_type)
 	{
 		case COMMON: break;
-		case ONLY_STORED_IN_STREAMINFO: sample_rate_hz = self.flac_info.sample_rate;
-		case UNCOMMON_KHZ_8: sample_rate_hz = (ushort)self.file.read_byte()! * 1000;
-		case UNCOMMON_HZ_16: sample_rate_hz = io::read_be_ushort(self.file)!;
-		case UNCOMMON_HZ_16_DIV10: sample_rate_hz = io::read_be_ushort(self.file)! * 10;
+		case ONLY_STORED_IN_STREAMINFO: next_frame.sample_rate = self.flac_info.sample_rate;
+		case UNCOMMON_KHZ_8: next_frame.sample_rate = (ushort)self.file.read_byte()! * 1000;
+		case UNCOMMON_HZ_16: next_frame.sample_rate = io::read_be_ushort(self.file)!;
+		case UNCOMMON_HZ_16_DIV10: next_frame.sample_rate = io::read_be_ushort(self.file)! * 10;
 	}
 
-	char crc = self.file.read_byte()!; // TODO: handle?
+	next_frame.crc = self.file.read_byte()!; // TODO: handle?
 
-	io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
+	//io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
+	io::printn(next_frame);
+	self.current_frame = next_frame;
 }
 
 // If it's a fixed block size stream this is a frame number, if it's a variable block size stream this is the sample number of the first sample in the frame
@@ -313,7 +340,7 @@ fn void? decode_subframe_header(FlacDecoder* self) @private
 		default: unreachable();
 	}
 	bool has_wasted_bits = (bool)(self.bit_reader.read_bits(1)!);
-	int wasted_bits /*@noinit*/; // TODO: check what the max number of wasted bits is to restrict type
+	int wasted_bits; // TODO: check what the max number of wasted bits is to restrict type
 	if (has_wasted_bits)
 	{
 		wasted_bits = 1;
@@ -369,16 +396,16 @@ enum FlacFrameChannels : char (char num_channels) @private
 	STEREO_RIGHT_SIDE {2},
 	STEREO_MID_SIDE {2},
 }
-enum FlacFrameBitDepth : char @private
+enum FlacFrameBitDepth : char (ichar bit_depth) @private
 {
-	ONLY_STORED_IN_STREAMINFO,
-	BPS_8,
-	BPS_12,
-	RESERVED,
-	BPS_16,
-	BPS_20,
-	BPS_24,
-	BPS_32,
+	ONLY_STORED_IN_STREAMINFO{-1},
+	BPS_8{8},
+	BPS_12{12},
+	RESERVED{-1},
+	BPS_16{16},
+	BPS_20{20},
+	BPS_24{24},
+	BPS_32{32},
 }
 enum FlacSubframeType : char @private
 {
