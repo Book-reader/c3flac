@@ -50,9 +50,10 @@ struct FlacFrame (Printable)
 	long frame_number;
 	uint sample_rate;
 	ushort block_size;
+	ushort frame_crc; // TODO: handle
 	FlacFrameChannels channels;
 	char bit_depth;
-	char crc; // TODO: handle
+	char header_crc; // TODO: handle
 	char decoded_subframes;
 	FlacSubframe[] subframes;
 }
@@ -142,7 +143,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		}
 	}
 
-	//for (sz i = 0; i < 10; i++)
+	for (sz i = 0; i < 10; i++)
 	{
 		decode_frame_header(&decoder)!!;
 		FlacSubframe subframe = decode_subframe_header(&decoder)!!;;
@@ -151,6 +152,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		decode_subframe(&decoder, &decoder.current_frame, &subframe1)!!;
 		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
 		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe1;
+		decode_frame_footer(&decoder)!!;
 		io::printn(decoder.current_frame);
 	}
 	//for (int i = 0; i < 20; i++) // find & decode more frame headers
@@ -271,7 +273,7 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 		case UNCOMMON_HZ_16_DIV10: next_frame.sample_rate = io::read_be_ushort(self.file)! * 10;
 	}
 
-	next_frame.crc = self.file.read_byte()!; // TODO: handle?
+	next_frame.header_crc = self.file.read_byte()!; // TODO: handle?
 	next_frame.subframes = alloc::new_array/*alloc_array*/(self.alloc, FlacSubframe, next_frame.channels.num_channels);
 
 	//io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
@@ -347,6 +349,14 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			abort("TODO: LINEAR_PREDICTOR");
 	}
+}
+
+fn void? decode_frame_footer(FlacDecoder* self)
+{
+	self.bit_reader.clear(); // we are now byte aligned, clear the bit reader. TODO: there is a redundant clear in decode_frame_header because of this
+	ushort crc = io::read_be_ushort(self.file)!;
+	io::printfn("footer crc: %s", crc);
+	self.current_frame.frame_crc = crc;
 }
 
 fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
