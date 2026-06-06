@@ -151,7 +151,8 @@ fn FlacDecoder? open(Allocator alloc, String file)
 
 	/*List {int} samples;
 	samples.tinit();*/
-	for (sz i = 0; i < /*4*//*92*/100; i++)
+	//for (sz i = 0; i < /*4*//*92*/100; i++)
+	while (true)
 	{
 		decode_frame_header(&decoder)!!;
 
@@ -167,7 +168,12 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		decorrelate_frame_channels(&decoder, &decoder.current_frame)!!;
 		//log::debug("%s", decoder.current_frame);
 		$if $feature(PLAY_TO_STDOUT):
-			/*while (true)*/ foreach (sample : decoder.current_frame.subframes[0].samples) io::write_le_short(io::stdout(), (short)sample)!!;
+			/*while (true)*/ foreach (sample : decoder.current_frame.subframes[0].samples)
+			{
+				io::stdout().write_byte((char)sample)!!;
+				io::stdout().write_byte((char)(sample >> 8))!!;
+				//io::stdout().write_byte((char)(sample >> 16))!!;
+			}
 			//samples.push_all(decoder.current_frame.subframes[0].samples);
 		$endif
 	}
@@ -383,6 +389,7 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			{
 				subframe.samples[i] = residual.next(self)! + get_subframe_fixed_predictor_prediction(self, subframe, i)!;
 			}
+			//log::debug("%s", subframe.samples);
 		case LINEAR_PREDICTOR:
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			for (sz i = 0; i < subframe.predictor_order; i++)
@@ -399,15 +406,15 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			{
 				ushort val = (ushort)self.bit_reader.read_more_bits(coefficient_precision)!;
 				log::debug("%.4b", val);
-				int shift_bits = bitsizeof(ushort) - coefficient_precision;
-				coefficients[subframe.predictor_order - (i + 1)] = (short)(val << coefficient_precision) >> coefficient_precision; // sign extend
+				int shift_bits = bitsizeof(short) - coefficient_precision;
+				coefficients[i] = (short)(val << shift_bits) >> shift_bits; // sign extend
 			}
 			FlacCodedResidualState residual;
 			residual.init(self, frame, subframe)!;
 			for (sz i = subframe.predictor_order; i < subframe.samples.len; i++)
 			{
 				long prediction;
-				foreach (j, coefficient : coefficients[:subframe.predictor_order])
+				foreach_r (j, coefficient : coefficients[:subframe.predictor_order])
 				{
 					prediction += (long)coefficient * subframe.samples[i - (j + 1)];
 				}
