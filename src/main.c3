@@ -26,6 +26,7 @@ faultdef
 	BAD_FLAC_FRAME_HEADER,
 	BAD_FLAC_SUBFRAME_HEADER,
 	BAD_CODED_NUMBER,
+	BAD_CODED_RESIDUAL,
 	BAD_FLAC_MAGIC,
 	// BAD_FLAC_METADATA_HEADER,
 ;
@@ -39,7 +40,7 @@ struct FlacDecoder (InStream)
 	BitReader bit_reader;
 	FlacStreamInfo flac_info;
 	FlacFrame current_frame;
-	SeekPoint[] seek_points;
+	FlacSeekPoint[] seek_points;
 	bool variable_block_size;
 	long prev_frame_number;
 }
@@ -55,14 +56,14 @@ struct FlacFrame (Printable)
 	char decoded_subframes;
 	FlacSubframe[] subframes;
 }
-fn sz? FlacFrame.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_format(*self, fmt, false);
+fn sz? FlacFrame.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_format((FlacFrame){...*self, .subframes = self.subframes[:self.decoded_subframes]}, fmt, false);
 
 struct FlacSubframe (Printable)
 {
 	int wasted_bits;
 	FlacSubframeType type;
 	char predictor_order;
-	int[] samples;
+	int[] samples; // TODO: when I do streaming these won't be all the samples, these will only be the last N samples for the predictor to work with, with constant subframes it will be empty or only the last decoded subframe
 }
 fn sz? FlacSubframe.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_format(*self, fmt, false);
 
@@ -127,7 +128,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 				if (has_seek_table) return BAD_FLAC~; // can only have one seek table
 				has_seek_table = true;
 				sz num_seek_points = header.size / SEEK_POINT_SIZE;
-				SeekPoint[] seek_points = alloc::alloc_array(alloc, SeekPoint, num_seek_points);
+				FlacSeekPoint[] seek_points = alloc::alloc_array(alloc, FlacSeekPoint, num_seek_points);
 				foreach (&seek_point : seek_points)
 				{
 					seek_point.sample_number = io::read_be_ulong(decoder.file)  ?? BAD_FLAC~!;
@@ -141,10 +142,17 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		}
 	}
 
-	decode_frame_header(&decoder)!!;
-	FlacSubframe subframe;
-	decode_subframe_header(&decoder, &subframe)!!;
-	decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
+	//for (sz i = 0; i < 10; i++)
+	{
+		decode_frame_header(&decoder)!!;
+		FlacSubframe subframe = decode_subframe_header(&decoder)!!;;
+		decode_subframe(&decoder, &decoder.current_frame, &subframe)!!;
+		FlacSubframe subframe1 = decode_subframe_header(&decoder)!!;;
+		decode_subframe(&decoder, &decoder.current_frame, &subframe1)!!;
+		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
+		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe1;
+		io::printn(decoder.current_frame);
+	}
 	//for (int i = 0; i < 20; i++) // find & decode more frame headers
 	/*while (true)
 	{
@@ -275,8 +283,9 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 
 // A subframe header is not guaranteed to be byte aligned unless it is the first after a frame header so it needs to use the bit reader
 // I need to make sure the bit reader is properly reset after using the regular file reader with something that is guaranteed to be byte aligned so it doesn't re-use old data stored when it was last used
-fn void? decode_subframe_header(FlacDecoder* self, FlacSubframe* subframe) @private
+fn FlacSubframe? decode_subframe_header(FlacDecoder* self) @private
 {
+	FlacSubframe subframe;
 	// TODO: compact these first 3 read_bits calls into a single read_bits(8) call and do the rest of the bit stuff manually, it should improve performance
 	if (@unlikely(self.bit_reader.read_bits(1)! != 0)) return BAD_FLAC_SUBFRAME_HEADER~;
 	switch (char v = self.bit_reader.read_bits(6)!)
@@ -293,18 +302,75 @@ fn void? decode_subframe_header(FlacDecoder* self, FlacSubframe* subframe) @priv
 			subframe.predictor_order = v - 31;
 		default: unreachable();
 	}
-	int wasted_bits = self.bit_reader.read_bits(1)!; // TODO: check what the max number of wasted bits is to restrict type
+	/*int wasted_bits = self.bit_reader.read_bits(1)!; // TODO: check what the max number of wasted bits is to restrict type
 	if (wasted_bits != 0)
 	{
 		while ((self.bit_reader.read_bits(1)! & (char)1) == 0) wasted_bits ++;
 	}
-	subframe.wasted_bits = wasted_bits;
+	subframe.wasted_bits = wasted_bits;*/
+	bool has_wasted_bits = self.bit_reader.read_bits(1)! != 0;
+	if (has_wasted_bits) subframe.wasted_bits = self.bit_reader.read_unary_number(int)! + 1;
 
 	//io::printfn("subframe type: {%s %s}, wasted bits: %s", subframe_type, predictor_order, wasted_bits);
-	io::printn(*subframe);
+	io::printn(subframe);
 	//if (has_wasted_bits) abort("TODO: handle wasted bits");
+	return subframe;
 }
 
+// TODO: if the current subframe is a side subframe (see section 4.2), increase the bit depth by 1
+fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
+{
+	switch (subframe.type)
+	{
+		case CONSTANT:
+			subframe.samples = alloc::alloc_array(self.alloc, int, 1);
+			subframe.samples[0] = decode_subframe_constant_sample(self, frame, subframe)!;
+		case VERBATIM:
+			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
+			for (sz i = 0; i < subframe.samples.len; i++)
+			{
+				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe)!;
+			}
+		case FIXED_PREDICTOR:
+			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
+			for (sz i = 0; i < subframe.predictor_order; i++)
+			{
+				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe)!;
+			}
+			FlacCodedResidualState residual;
+			residual.init(self, frame, subframe)!;
+			for (sz i = subframe.predictor_order; i < subframe.samples.len; i++)
+			{
+				subframe.samples[i] = residual.next(self)! + get_subframe_fixed_predictor_prediction(self, subframe, i)!;
+			}
+		case LINEAR_PREDICTOR:
+			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
+			abort("TODO: LINEAR_PREDICTOR");
+	}
+}
+
+fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
+{
+	int bits_remaining = frame.bit_depth - subframe.wasted_bits;
+	if (bits_remaining <= 0) return BAD_FLAC~;
+	uint res = self.bit_reader.read_more_bits(bits_remaining)!;
+	res <<= subframe.wasted_bits;
+	return (int)res;
+}
+
+fn int? get_subframe_fixed_predictor_prediction(FlacDecoder* self, FlacSubframe* subframe, sz n) @private
+{
+	// TODO: maybe move this switch into the place it's used so it only switches once and then does a full loop without any more branching
+	switch (subframe.predictor_order)
+	{
+		case 0: return 0;
+		case 1: return subframe.samples[n - 1];
+		case 2: return (int)(2 * (long)subframe.samples[n - 1] - subframe.samples[n - 2]);
+		case 3: return (int)(3 * (long)subframe.samples[n - 1] - 3 * (long)subframe.samples[n - 2] + subframe.samples[n - 3]);
+		case 4: return (int)(4 * (long)subframe.samples[n - 1] - 6 * (long)subframe.samples[n - 2] + 4 * (long)subframe.samples[n - 3] - subframe.samples[n - 4]);
+		default: unreachable();
+	}
+}
 
 
 // If it's a fixed block size stream this is a frame number, if it's a variable block size stream this is the sample number of the first sample in the frame
@@ -447,7 +513,7 @@ struct FlacStreamInfo @private
 	uint128 md5_checksum;           // checksum of unencoded audio, 0 means not known.
 }
 
-struct SeekPoint @private
+struct FlacSeekPoint @private
 {
 	ulong sample_number;
 	ulong offset;
@@ -463,4 +529,106 @@ bitstruct FlacFrameHeaderFirstPart : uint/*char[4]*/ @bigendian @private
 	char   channel_bits        : 4..7/*24..27*/;
 	char   bit_depth_bits      : 1..3/*28..30*/;
 	char   reserved_bit        : 0..0/*31*/; // MUST be 0
+}
+
+struct FlacCodedResidualState //@nopadding
+{
+	//char partition_order;
+	short num_partitions;
+	ushort num_residual_samples;
+	ushort num_first_residual_samples;
+	char parameter_size;
+	char current_partition_parameter;
+	short current_partition;
+	ushort current_partition_sample_num;
+	char residual_sample_bits;
+}
+
+const char ESCAPED_PARTITION = 0xFF;
+
+fn void? FlacCodedResidualState.init(&self, FlacDecoder* decoder, FlacFrame* frame, FlacSubframe* subframe)
+{
+	FlacCodedResidualState new @noinit;
+	char coding_method = decoder.bit_reader.read_bits(2)!;
+	switch (coding_method)
+	{
+		case 0b00: new.parameter_size = 4;
+		case 0b01: new.parameter_size = 5;
+		case 0b10..0b11: return BAD_CODED_RESIDUAL~;
+		default: unreachable();
+	}
+	char partition_order = decoder.bit_reader.read_bits(4)!;
+	new.num_partitions = 1 << partition_order;
+	new.current_partition = -1;
+	new.num_residual_samples = (frame.block_size >> partition_order);
+	new.num_first_residual_samples = new.num_residual_samples - subframe.predictor_order;
+	new.current_partition_sample_num = new.num_residual_samples;
+	*self = new;
+
+	if (@unlikely(frame.block_size % partition_order != 0)) return BAD_CODED_RESIDUAL~;
+	if (@unlikely(new.num_residual_samples <= subframe.predictor_order)) return BAD_CODED_RESIDUAL~;
+}
+
+fn int? FlacCodedResidualState.next(&self, FlacDecoder* decoder)
+{
+	if (self.current_partition_sample_num == self.num_residual_samples)
+	{
+		if (self.current_partition <= 0) @swap(self.num_residual_samples, self.num_first_residual_samples);
+		self.current_partition ++;
+		self.current_partition_sample_num = 0;
+		char parameter = decoder.bit_reader.read_bits(self.parameter_size)!;
+		if (parameter == (1 << self.parameter_size) - 1) // it's an escape code, 0b1111 for a parameter size of 4 or 0b11111 for a parameter size of 5
+		{
+			parameter = ESCAPED_PARTITION;
+			self.residual_sample_bits = decoder.bit_reader.read_bits(5)!;
+		}
+		self.current_partition_parameter = parameter;
+	}
+	defer self.current_partition_sample_num ++;
+
+	if (self.current_partition_parameter == ESCAPED_PARTITION) // it's an escaped partition with fixed residual sample sizes
+	{
+		if (self.residual_sample_bits == 0) return 0;
+		uint raw_sample = decoder.bit_reader.read_more_bits(self.residual_sample_bits)!;
+		int shift_bits = uint::size - self.residual_sample_bits;
+		int final_sample = (int)(raw_sample << shift_bits) >> shift_bits; // make use of signed int sign extension when right shifting to sign extend the sample
+		return (int)final_sample;
+	}
+	else // it's a rice-coded residual
+	{
+		uint most_significant_part = decoder.bit_reader.read_unary_number(uint)!;
+		uint least_significant_part = self.current_partition_parameter == 0 ? 0 : decoder.bit_reader.read_more_bits(self.current_partition_parameter)!;
+		uint folded_residual = (most_significant_part << self.current_partition_parameter) | least_significant_part;
+		// These both get optimised to the same thing so I use the more readable one
+		int final_sample = folded_residual % 2 == 0 ? (int)(folded_residual >> 1) : (int)~(folded_residual >> 1);
+		//uint maybe_invert_mask = -(folded_residual & 0x01);
+		//int final_sample = (int)((folded_residual >> 1) ^ maybe_invert_mask);
+		return final_sample;
+	}
+}
+
+
+<*
+ @require nbits > 0 && nbits <= 32
+*>
+fn uint? BitReader.read_more_bits(&self, int nbits)
+{
+	uint res;
+	while (nbits >= 8)
+	{
+		res = (res << 8) | self.read_bits(8)!;
+		nbits -= 8;
+	}
+	if (nbits != 0)
+	{
+		res = (res << nbits) | self.read_bits(nbits)!;
+	}
+	return res;
+}
+
+macro BitReader.read_unary_number(&self, $NumType)
+{
+	$NumType res = 0;
+	while (self.read_bits(1)! == 0) res++;
+	return res;
 }
