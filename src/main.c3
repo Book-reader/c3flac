@@ -4,11 +4,11 @@ import flac;
 
 fn int main(String[] args)
 {
-	$if $feature(PLAY_TO_STDOUT):
+	/*$if $feature(PLAY_TO_STDOUT):
 		log::set_priority_all(CRITICAL);
-	$else
+	$else*/
 		log::set_priority_all(DEBUG);
-	$endif
+	//$endif
 	FlacDecoder f = flac::open(tmem, args[1])!!;
 	defer (void)f.close();
 
@@ -73,7 +73,7 @@ struct FlacSubframe (Printable)
 }
 fn sz? FlacSubframe.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_format(*self, fmt, false);
 
-//import std::collections::list;
+import std::collections::list;
 fn FlacDecoder? open(Allocator alloc, String file)
 {
 	log::debug(file);
@@ -151,20 +151,23 @@ fn FlacDecoder? open(Allocator alloc, String file)
 
 	/*List {int} samples;
 	samples.tinit();*/
-	for (sz i = 0; i < /*4*/10; i++)
+	for (sz i = 0; i < /*4*//*92*/100; i++)
 	{
 		decode_frame_header(&decoder)!!;
+
 		FlacSubframe subframe = decode_subframe_header(&decoder)!!;;
 		decode_subframe(&decoder, &decoder.current_frame, &subframe)!!;
+		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
+
 		FlacSubframe subframe1 = decode_subframe_header(&decoder)!!;;
 		decode_subframe(&decoder, &decoder.current_frame, &subframe1)!!;
-		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
 		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe1;
+
 		decode_frame_footer(&decoder)!!;
 		decorrelate_frame_channels(&decoder, &decoder.current_frame)!!;
-		log::debug("%s", decoder.current_frame);
+		//log::debug("%s", decoder.current_frame);
 		$if $feature(PLAY_TO_STDOUT):
-			while (true) foreach (sample : decoder.current_frame.subframes[0].samples) io::write_le_short(io::stdout(), (short)sample)!!;
+			/*while (true)*/ foreach (sample : decoder.current_frame.subframes[0].samples) io::write_le_short(io::stdout(), (short)sample)!!;
 			//samples.push_all(decoder.current_frame.subframes[0].samples);
 		$endif
 	}
@@ -300,8 +303,22 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 
 fn void? decorrelate_frame_channels(FlacDecoder* self, FlacFrame* frame)
 {
-	if (frame.channels.num_channels != 2 || frame.channels == STEREO) return; // no decorrelation needs to be done
-	abort("TODO: interchannel decorrelation is not supported yet: %s", frame.channels);
+	if (!frame.channels.is_correlated) return; // no decorrelation needs to be done
+	if (frame.channels != STEREO_MID_SIDE) abort("TODO: interchannel decorrelation is not supported yet: %s", frame.channels);
+
+	int[] mid = mem::@clone_slice(frame.subframes[0].samples);
+	defer mem::free(mid);
+	int[] side = mem::@clone_slice(frame.subframes[1].samples);
+	defer mem::free(side);
+
+	foreach (i, mid_sample : mid)
+	{
+		int side_sample = side[i];
+		mid_sample <<= 1;
+		if (side_sample % 2 == 1) mid_sample += 1;
+		frame.subframes[0].samples[i] = (mid_sample + side_sample) >> 1;
+		frame.subframes[1].samples[i] = (mid_sample - side_sample) >> 1;
+	}
 }
 
 // A subframe header is not guaranteed to be byte aligned unless it is the first after a frame header so it needs to use the bit reader
@@ -373,6 +390,7 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe)!;
 			}
 			char coefficient_precision = self.bit_reader.read_bits(4)! + 1;
+			log::debug("coefficient_precision: %s %.8b", coefficient_precision, coefficient_precision);
 			if (@unlikely(coefficient_precision == (1 << 4))) return BAD_FLAC~;
 			char prediction_shift = self.bit_reader.read_bits(5)!;
 			if (@unlikely(prediction_shift & 0x10 != 0)) return BAD_FLAC~; // if the fifth bit is set it's attempting to do a negative shift, which isn't allowed (see Appendix B.4)
@@ -380,8 +398,9 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			for (sz i = 0; i < subframe.predictor_order; i++)
 			{
 				ushort val = (ushort)self.bit_reader.read_more_bits(coefficient_precision)!;
+				log::debug("%.4b", val);
 				int shift_bits = bitsizeof(ushort) - coefficient_precision;
-				coefficients[subframe.predictor_order - i] = (short)(val << coefficient_precision) >> coefficient_precision; // sign extend
+				coefficients[subframe.predictor_order - (i + 1)] = (short)(val << coefficient_precision) >> coefficient_precision; // sign extend
 			}
 			FlacCodedResidualState residual;
 			residual.init(self, frame, subframe)!;
@@ -413,8 +432,10 @@ fn void? decode_frame_footer(FlacDecoder* self)
 fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
 {
 	int bits_remaining = frame.bit_depth - subframe.wasted_bits;
+	if (frame.channels.is_correlated && frame.decoded_subframes == 1) bits_remaining ++;
 	if (bits_remaining <= 0) return BAD_FLAC~;
-	uint res = (int)self.bit_reader.read_more_bits(bits_remaining)!;
+	uint res = self.bit_reader.read_more_bits(bits_remaining)!;
+	if (@unlikely(res > int::max || (res << subframe.wasted_bits) > int::max)) abort("correlated side channel resulted in a value over 32 bits, TODO: handle?");
 	res <<= subframe.wasted_bits;
 	int shift_bits = bitsizeof(int) - frame.bit_depth;
 	return (int)(res << shift_bits) >> shift_bits; // sign extend the decoded value
@@ -522,19 +543,19 @@ constdef FlacMetadataHeaderType : char @private
 
 enum FlacFrameBlockSizeType  : char @private {COMMON, UNCOMMON_8, UNCOMMON_16}
 enum FlacFrameSampleRateType : char @private {COMMON, ONLY_STORED_IN_STREAMINFO, UNCOMMON_KHZ_8, UNCOMMON_HZ_16, UNCOMMON_HZ_16_DIV10}
-enum FlacFrameChannels : char (char num_channels) @private
+enum FlacFrameChannels : char (char num_channels, bool is_correlated) @private
 {
-	MONO {1},
-	STEREO {2},
-	THREE {3},
-	FOUR {4},
-	FIVE {5},
-	SIX {6},
-	SEVEN {7},
-	EIGHT {8},
-	STEREO_LEFT_SIDE {2},
-	STEREO_RIGHT_SIDE {2},
-	STEREO_MID_SIDE {2},
+	MONO {1, false},
+	STEREO {2, false},
+	THREE {3, false},
+	FOUR {4, false},
+	FIVE {5, false},
+	SIX {6, false},
+	SEVEN {7, false},
+	EIGHT {8, false},
+	STEREO_LEFT_SIDE {2, true},
+	STEREO_RIGHT_SIDE {2, true},
+	STEREO_MID_SIDE {2, true},
 }
 enum FlacFrameBitDepth : char (ichar bit_depth) @private
 {
