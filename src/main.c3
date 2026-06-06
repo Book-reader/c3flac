@@ -4,6 +4,11 @@ import flac;
 
 fn int main(String[] args)
 {
+	$if $feature(PLAY_TO_STDOUT):
+		log::set_priority_all(CRITICAL);
+	$else
+		log::set_priority_all(DEBUG);
+	$endif
 	FlacDecoder f = flac::open(tmem, args[1])!!;
 	defer (void)f.close();
 
@@ -70,7 +75,7 @@ fn sz? FlacSubframe.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_f
 
 fn FlacDecoder? open(Allocator alloc, String file)
 {
-	io::printn(file);
+	log::debug(file);
 	File flac_file = file::open(file, "rb")!;
 
 	uint magic = io::read_be_uint(&flac_file) ?? BAD_FLAC~!;
@@ -108,13 +113,13 @@ fn FlacDecoder? open(Allocator alloc, String file)
 	decoder.flac_info = flac_info;
 	decoder.variable_block_size = flac_info.min_block_size != flac_info.max_block_size;
 
-	io::printn(flac_info);
+	log::debug("%s", flac_info);
 
 	bool has_seek_table = false;
 	while (!header.last)
 	{
 		io::read_any(decoder.file, &header) ?? BAD_FLAC~!;
-		io::printn(header);
+		//log::debug("%s", header);
 		switch (header.type)
 		{
 			case PADDING:
@@ -153,7 +158,10 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
 		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe1;
 		decode_frame_footer(&decoder)!!;
-		io::printn(decoder.current_frame);
+		log::debug("%s", decoder.current_frame);
+		$if $feature(PLAY_TO_STDOUT):
+			while (true) foreach (sample : decoder.current_frame.subframes[0].samples) io::write_le_short(io::stdout(), (short)sample)!!;
+		$endif
 	}
 	//for (int i = 0; i < 20; i++) // find & decode more frame headers
 	/*while (true)
@@ -169,7 +177,7 @@ fn FlacDecoder? open(Allocator alloc, String file)
 			prev_byte = next_byte;
 		}
 		decoder.file.seek(-2, FROM_CURSOR)!!; // seek back to the start of the header part
-		io::printf("Scanned to what seems to be a frame header, ");
+		log::debug("Scanned to what seems to be a frame header, ");
 		decode_frame_header(&decoder)!!; // decode the next frame header
 	}*/
 
@@ -200,10 +208,10 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	self.bit_reader.clear();
 	FlacFrame next_frame /*@noinit*/;
 
-	io::printn("Decoding frame header");
+	log::debug("Decoding frame header");
 	FlacFrameHeaderFirstPart header_part_1;
 	io::read_any(self.file, &header_part_1)!;
-	//io::printfn("header pt 1 %.32b", ((UIntBE)(uint)header_part_1).val);
+	//log::debug("header pt 1 %.32b", ((UIntBE)(uint)header_part_1).val);
 	if (@unlikely(header_part_1.sync_code != SYNC_CODE)) return BAD_FLAC_FRAME_HEADER~; // TODO: have a feature flag to disable some runtime validity checking.
 	if (@unlikely(header_part_1.variable_block_size != self.variable_block_size)) return BAD_FLAC_FRAME_HEADER~;
 	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC_FRAME_HEADER~;
@@ -276,8 +284,8 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 	next_frame.header_crc = self.file.read_byte()!; // TODO: handle?
 	next_frame.subframes = alloc::new_array/*alloc_array*/(self.alloc, FlacSubframe, next_frame.channels.num_channels);
 
-	//io::printfn("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
-	io::printn(next_frame);
+	//log::debug("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
+	log::debug("%s", next_frame);
 	self.current_frame = next_frame;
 }
 
@@ -313,8 +321,8 @@ fn FlacSubframe? decode_subframe_header(FlacDecoder* self) @private
 	bool has_wasted_bits = self.bit_reader.read_bits(1)! != 0;
 	if (has_wasted_bits) subframe.wasted_bits = self.bit_reader.read_unary_number(int)! + 1;
 
-	//io::printfn("subframe type: {%s %s}, wasted bits: %s", subframe_type, predictor_order, wasted_bits);
-	io::printn(subframe);
+	//log::debug("subframe type: {%s %s}, wasted bits: %s", subframe_type, predictor_order, wasted_bits);
+	log::debug("%s", subframe);
 	//if (has_wasted_bits) abort("TODO: handle wasted bits");
 	return subframe;
 }
@@ -355,7 +363,7 @@ fn void? decode_frame_footer(FlacDecoder* self)
 {
 	self.bit_reader.clear(); // we are now byte aligned, clear the bit reader. TODO: there is a redundant clear in decode_frame_header because of this
 	ushort crc = io::read_be_ushort(self.file)!;
-	io::printfn("footer crc: %s", crc);
+	log::debug("footer crc: %s", crc);
 	self.current_frame.frame_crc = crc;
 }
 
