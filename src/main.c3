@@ -201,18 +201,67 @@ fn FlacFrame? decode_frame(FlacDecoder* flac) @private
 		case EIGHT:
 			for (sz i = 0; i < frame.channels.num_channels; i++)
 			{
-				FlacSubframe subframe = decode_subframe_header(flac)!;
-				decode_subframe(flac, &frame, &subframe)!;
-				frame.subframes[frame.decoded_subframes++] = subframe;
+				frame.subframes[frame.decoded_subframes++] = decode_subframe(flac, &frame)!;
 			}
 		case STEREO_LEFT_SIDE:
+			decode_stereo_left_side_frame(flac, &frame)!;
 		case STEREO_MID_SIDE:
+			decode_stereo_mid_side_frame(flac, &frame)!;
 		case STEREO_RIGHT_SIDE:
-			abort("TODO: decode & decorrelate %s", frame.channels);
+			decode_stereo_side_right_frame(flac, &frame)!;
 	}
 	decode_frame_footer(flac, &frame)!;
 	return frame;
 }
+
+fn void? decode_stereo_mid_side_frame(FlacDecoder* flac, FlacFrame* frame)
+{
+	FlacSubframe mid_channel = decode_subframe(flac, frame)!;
+	FlacSubframe side_channel = decode_subframe(flac, frame, true)!;
+	assert(mid_channel.samples.len == side_channel.samples.len && mid_channel.samples.len == frame.block_size);
+	for (sz i = 0; i < frame.block_size; i++)
+	{
+		int mid = mid_channel.samples[i] << 1;
+		int side = side_channel.samples[i];
+		// if (side % 2 == 1) mid += 1;
+		mid += side % 2;
+		mid_channel.samples[i] = (mid + side) >> 1; // now the left channel
+		side_channel.samples[i] = (mid - side) >> 1; // now the right channel
+	}
+	frame.subframes[frame.decoded_subframes++] = mid_channel;
+	frame.subframes[frame.decoded_subframes++] = side_channel;
+}
+
+fn void? decode_stereo_left_side_frame(FlacDecoder* flac, FlacFrame* frame)
+{
+	FlacSubframe left_channel = decode_subframe(flac, frame)!;
+	FlacSubframe side_channel = decode_subframe(flac, frame, true)!;
+	assert(left_channel.samples.len == side_channel.samples.len && left_channel.samples.len == frame.block_size);
+	for (sz i = 0; i < frame.block_size; i++)
+	{
+		int left = left_channel.samples[i];
+		int side = side_channel.samples[i];
+		side_channel.samples[i] = left - side; // now the right channel
+	}
+	frame.subframes[frame.decoded_subframes++] = left_channel;
+	frame.subframes[frame.decoded_subframes++] = side_channel;
+}
+
+fn void? decode_stereo_side_right_frame(FlacDecoder* flac, FlacFrame* frame)
+{
+	FlacSubframe side_channel = decode_subframe(flac, frame, true)!;
+	FlacSubframe right_channel = decode_subframe(flac, frame)!;
+	assert(right_channel.samples.len == side_channel.samples.len && right_channel.samples.len == frame.block_size);
+	for (sz i = 0; i < frame.block_size; i++)
+	{
+		int side = side_channel.samples[i];
+		int right = right_channel.samples[i];
+		side_channel.samples[i] = right + side; // now the left channel
+	}
+	frame.subframes[frame.decoded_subframes++] = side_channel;
+	frame.subframes[frame.decoded_subframes++] = right_channel;
+}
+
 
 macro void @each_channel_sample(FlacFrame* frame; @body(int[] channel_samples))
 {
@@ -237,7 +286,7 @@ fn FlacFrame? decode_frame_header(FlacDecoder* self) @private
 	log::debug("Decoding frame header");
 	FlacFrameHeaderFirstPart header_part_1;
 	io::read_any(self.file, &header_part_1)!;
-	//log::debug("header pt 1 %.32b", ((UIntBE)(uint)header_part_1).val);
+
 	if (@unlikely(header_part_1.sync_code != SYNC_CODE)) return BAD_FLAC_FRAME_HEADER~; // TODO: have a feature flag to disable some runtime validity checking.
 	if (@unlikely(header_part_1.variable_block_size != self.variable_block_size)) return BAD_FLAC_FRAME_HEADER~;
 	if (@unlikely(header_part_1.reserved_bit != 0)) return BAD_FLAC_FRAME_HEADER~;
@@ -316,24 +365,11 @@ fn FlacFrame? decode_frame_header(FlacDecoder* self) @private
 	return next_frame;
 }
 
-fn void? decorrelate_frame_channels(FlacDecoder* self, FlacFrame* frame)
+fn FlacSubframe? decode_subframe(FlacDecoder* flac, FlacFrame* frame, bool extra_depth_bit = false) @private
 {
-	if (!frame.channels.is_correlated) return; // no decorrelation needs to be done
-	if (frame.channels != STEREO_MID_SIDE) abort("TODO: interchannel decorrelation is not supported yet: %s", frame.channels);
-
-	int[] mid = mem::@clone_slice(frame.subframes[0].samples);
-	defer mem::free(mid);
-	int[] side = mem::@clone_slice(frame.subframes[1].samples);
-	defer mem::free(side);
-
-	foreach (i, mid_sample : mid)
-	{
-		int side_sample = side[i];
-		mid_sample <<= 1;
-		if (side_sample % 2 == 1) mid_sample += 1;
-		frame.subframes[0].samples[i] = (mid_sample + side_sample) >> 1;
-		frame.subframes[1].samples[i] = (mid_sample - side_sample) >> 1;
-	}
+	FlacSubframe subframe = decode_subframe_header(flac)!;
+	decode_subframe_data(flac, frame, &subframe, extra_depth_bit)!;
+	return subframe;
 }
 
 // A subframe header is not guaranteed to be byte aligned unless it is the first after a frame header so it needs to use the bit reader
@@ -357,23 +393,16 @@ fn FlacSubframe? decode_subframe_header(FlacDecoder* self) @private
 			subframe.predictor_order = v - 31;
 		default: unreachable();
 	}
-	/*int wasted_bits = self.bit_reader.read_bits(1)!; // TODO: check what the max number of wasted bits is to restrict type
-	if (wasted_bits != 0)
-	{
-		while ((self.bit_reader.read_bits(1)! & (char)1) == 0) wasted_bits ++;
-	}
-	subframe.wasted_bits = wasted_bits;*/
+
 	bool has_wasted_bits = self.bit_reader.read_bits(1)! != 0;
 	if (has_wasted_bits) subframe.wasted_bits = self.bit_reader.read_unary_number(int)! + 1;
 
-	//log::debug("subframe type: {%s %s}, wasted bits: %s", subframe_type, predictor_order, wasted_bits);
 	log::debug("%s", subframe);
 	if (has_wasted_bits) abort("TODO: wasted bits are not supported yet");
 	return subframe;
 }
 
-// TODO: if the current subframe is a side subframe (see section 4.2), increase the bit depth by 1
-fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
+fn void? decode_subframe_data(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe, bool extra_depth_bit) @private
 {
 	switch (subframe.type)
 	{
@@ -382,18 +411,18 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			/*subframe.samples = alloc::alloc_array(self.alloc, int, 1);
 			subframe.samples[0] = decode_subframe_constant_sample(self, frame, subframe)!;*/
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
-			subframe.samples[..] = decode_subframe_constant_sample(self, frame, subframe)!;
+			subframe.samples[..] = decode_subframe_constant_sample(self, frame, subframe, extra_depth_bit)!;
 		case VERBATIM:
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			for (sz i = 0; i < subframe.samples.len; i++)
 			{
-				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe)!;
+				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe, extra_depth_bit)!;
 			}
 		case FIXED_PREDICTOR:
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			for (sz i = 0; i < subframe.predictor_order; i++)
 			{
-				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe)!;
+				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe, extra_depth_bit)!;
 			}
 			FlacCodedResidualState residual;
 			residual.init(self, frame, subframe)!;
@@ -405,7 +434,7 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			for (sz i = 0; i < subframe.predictor_order; i++)
 			{
-				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe)!;
+				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe, extra_depth_bit)!;
 			}
 			char coefficient_precision = self.bit_reader.read_bits(4)! + 1;
 			log::debug("coefficient_precision: %s %.8b", coefficient_precision, coefficient_precision);
@@ -442,10 +471,9 @@ fn void? decode_frame_footer(FlacDecoder* self, FlacFrame* frame)
 	frame.frame_crc = crc;
 }
 
-fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
+fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe, bool extra_depth_bit) @private
 {
-	int bits_remaining = frame.bit_depth - subframe.wasted_bits;
-	if (frame.channels.is_correlated && frame.decoded_subframes == 1) bits_remaining ++;
+	int bits_remaining = frame.bit_depth - subframe.wasted_bits + (int)extra_depth_bit;
 	if (bits_remaining <= 0) return BAD_FLAC~;
 	uint res = self.bit_reader.read_more_bits(bits_remaining)!;
 	if (@unlikely(res > int::max || (res << subframe.wasted_bits) > int::max)) abort("correlated side channel resulted in a value over 32 bits, TODO: handle?");
