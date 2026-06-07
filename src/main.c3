@@ -44,7 +44,7 @@ struct FlacDecoder (InStream)
 	File* file; // TODO: support reading from any InStream?
 	BitReader bit_reader;
 	FlacStreamInfo flac_info;
-	FlacFrame current_frame;
+	//FlacFrame current_frame;
 	FlacSeekPoint[] seek_points;
 	bool variable_block_size;
 	long prev_frame_number;
@@ -73,7 +73,6 @@ struct FlacSubframe (Printable)
 }
 fn sz? FlacSubframe.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_format(*self, fmt, false);
 
-import std::collections::list;
 fn FlacDecoder? open(Allocator alloc, String file)
 {
 	log::debug(file);
@@ -149,55 +148,22 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		}
 	}
 
-	/*List {int} samples;
-	samples.tinit();*/
-	//for (sz i = 0; i < /*4*//*92*/100; i++)
 	while (true)
 	{
-		decode_frame_header(&decoder)!!;
-
-		FlacSubframe subframe = decode_subframe_header(&decoder)!!;;
-		decode_subframe(&decoder, &decoder.current_frame, &subframe)!!;
-		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe;
-
-		FlacSubframe subframe1 = decode_subframe_header(&decoder)!!;;
-		decode_subframe(&decoder, &decoder.current_frame, &subframe1)!!;
-		decoder.current_frame.subframes[decoder.current_frame.decoded_subframes++] = subframe1;
-
-		decode_frame_footer(&decoder)!!;
-		decorrelate_frame_channels(&decoder, &decoder.current_frame)!!;
-		//log::debug("%s", decoder.current_frame);
+		FlacFrame frame = decode_frame(&decoder)!!;
+		if (@unlikely(frame.channels.num_channels != 2)) abort("Tried to output audio with a channel count other than 2");
+		// used to convert each sample into a 32-bit sample so it can be piped into `aplay -t raw -f S32_LE -c2 -r44100`
+		int shift_bits = bitsizeof(int) - frame.bit_depth;
 		$if $feature(PLAY_TO_STDOUT):
-			/*while (true)*/ foreach (sample : decoder.current_frame.subframes[0].samples)
+			@each_channel_sample(&frame; int[] channel_samples)
 			{
-				io::stdout().write_byte((char)sample)!!;
-				io::stdout().write_byte((char)(sample >> 8))!!;
-				//io::stdout().write_byte((char)(sample >> 16))!!;
-			}
-			//samples.push_all(decoder.current_frame.subframes[0].samples);
+				foreach (sample : channel_samples)
+				{
+					io::write_le_int(io::stdout(), sample << shift_bits)!!;
+				}
+			};
 		$endif
 	}
-	/*$if $feature(PLAY_TO_STDOUT):
-		while (true) foreach (sample : samples) io::write_le_short(io::stdout(), (short)sample)!!;
-	$endif*/
-
-	//for (int i = 0; i < 20; i++) // find & decode more frame headers
-	/*while (true)
-	{
-		char prev_byte = decoder.file.read_byte()!!;
-		while (true)
-		{
-			char next_byte = decoder.file.read_byte()!!;
-			char third_byte = decoder.file.read_byte()!!;
-			char fourth_byte = decoder.file.read_byte()!!;
-			decoder.file.seek(-2, FROM_CURSOR)!!;
-			if (prev_byte == 0xFF && next_byte == (0xF8 | (char)decoder.variable_block_size) && (third_byte >> 4u) != 0 && fourth_byte & 0x01 == 0) break;
-			prev_byte = next_byte;
-		}
-		decoder.file.seek(-2, FROM_CURSOR)!!; // seek back to the start of the header part
-		log::debug("Scanned to what seems to be a frame header, ");
-		decode_frame_header(&decoder)!!; // decode the next frame header
-	}*/
 
 	return decoder;
 }
@@ -220,8 +186,50 @@ const uint[0xF] SAMPLE_RATE_TABLE =
 	[0xB] = 96_000,  // 96    kHz
 };
 
+fn FlacFrame? decode_frame(FlacDecoder* flac) @private
+{
+	FlacFrame frame = decode_frame_header(flac)!;
+	switch (frame.channels)
+	{
+		case MONO:
+		case STEREO:
+		case THREE:
+		case FOUR:
+		case FIVE:
+		case SIX:
+		case SEVEN:
+		case EIGHT:
+			for (sz i = 0; i < frame.channels.num_channels; i++)
+			{
+				FlacSubframe subframe = decode_subframe_header(flac)!;
+				decode_subframe(flac, &frame, &subframe)!;
+				frame.subframes[frame.decoded_subframes++] = subframe;
+			}
+		case STEREO_LEFT_SIDE:
+		case STEREO_MID_SIDE:
+		case STEREO_RIGHT_SIDE:
+			abort("TODO: decode & decorrelate %s", frame.channels);
+	}
+	decode_frame_footer(flac, &frame)!;
+	return frame;
+}
+
+macro void @each_channel_sample(FlacFrame* frame; @body(int[] channel_samples))
+{
+	int[FlacFrameChannels.EIGHT.num_channels] vals;
+
+	for (sz i = 0; i < frame.block_size; i++)
+	{
+		for (sz j = 0; j < frame.channels.num_channels; j++)
+		{
+			vals[j] = frame.subframes[j].samples[i];
+		}
+		@body(vals[:frame.channels.num_channels]);
+	}
+}
+
 // This will always start and end at a byte boundary so the file can be read from directly
-fn void? decode_frame_header(FlacDecoder* self) @private
+fn FlacFrame? decode_frame_header(FlacDecoder* self) @private
 {
 	self.bit_reader.clear();
 	FlacFrame next_frame /*@noinit*/;
@@ -304,7 +312,8 @@ fn void? decode_frame_header(FlacDecoder* self) @private
 
 	//log::debug("frame %s, block size: {%s %s}, sample rate: {%s %s}, channels: %s, bit depth: %s", frame_number, block_size_type, block_size, sample_rate_type, sample_rate_hz, channels, bit_depth);
 	log::debug("%s", next_frame);
-	self.current_frame = next_frame;
+	// self.current_frame = next_frame;
+	return next_frame;
 }
 
 fn void? decorrelate_frame_channels(FlacDecoder* self, FlacFrame* frame)
@@ -369,8 +378,11 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 	switch (subframe.type)
 	{
 		case CONSTANT:
-			subframe.samples = alloc::alloc_array(self.alloc, int, 1);
-			subframe.samples[0] = decode_subframe_constant_sample(self, frame, subframe)!;
+			// TODO: optimise constant subframes to only store the value once
+			/*subframe.samples = alloc::alloc_array(self.alloc, int, 1);
+			subframe.samples[0] = decode_subframe_constant_sample(self, frame, subframe)!;*/
+			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
+			subframe.samples[..] = decode_subframe_constant_sample(self, frame, subframe)!;
 		case VERBATIM:
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			for (sz i = 0; i < subframe.samples.len; i++)
@@ -389,7 +401,6 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 			{
 				subframe.samples[i] = residual.next(self)! + get_subframe_fixed_predictor_prediction(self, subframe, i)!;
 			}
-			//log::debug("%s", subframe.samples);
 		case LINEAR_PREDICTOR:
 			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
 			for (sz i = 0; i < subframe.predictor_order; i++)
@@ -419,21 +430,16 @@ fn void? decode_subframe(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subf
 					prediction += (long)coefficient * subframe.samples[i - (j + 1)];
 				}
 				prediction >>= prediction_shift;
-				//log::debug("prediction %s", prediction);
 				subframe.samples[i] = residual.next(self)! + (int)prediction;
 			}
-			/*log::debug("%s", coefficients);
-			log::debug("%s", subframe.samples);*/
-			//abort("TODO: LINEAR_PREDICTOR");
 	}
 }
 
-fn void? decode_frame_footer(FlacDecoder* self)
+fn void? decode_frame_footer(FlacDecoder* self, FlacFrame* frame)
 {
 	self.bit_reader.clear(); // we are now byte aligned, clear the bit reader. TODO: there is a redundant clear in decode_frame_header because of this
 	ushort crc = io::read_be_ushort(self.file)!;
-	log::debug("footer crc: %s", crc);
-	self.current_frame.frame_crc = crc;
+	frame.frame_crc = crc;
 }
 
 fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe) @private
@@ -691,8 +697,8 @@ fn int? FlacCodedResidualState.next(&self, FlacDecoder* decoder)
 		uint folded_residual = (most_significant_part << self.current_partition_parameter) | least_significant_part;
 		// These both get optimised to the same thing so I use the more readable one
 		int final_sample = folded_residual % 2 == 0 ? (int)(folded_residual >> 1) : (int)~(folded_residual >> 1);
-		//uint maybe_invert_mask = -(folded_residual & 0x01);
-		//int final_sample = (int)((folded_residual >> 1) ^ maybe_invert_mask);
+		// uint maybe_invert_mask = -(folded_residual & 0x01);
+		// int final_sample = (int)((folded_residual >> 1) ^ maybe_invert_mask);
 		return final_sample;
 	}
 }
