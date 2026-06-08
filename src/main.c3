@@ -24,43 +24,6 @@ module flac;
 import std::io;
 import std::math;
 
-typedef Int = inline int;
-
-fn Int Int.add(self, Int other) @operator(+) => self.overflow_add(other)!!;
-fn Int Int.sub(self, Int other) @operator(+) => self.overflow_sub(other)!!;
-fn Int Int.mul(self, Int other) @operator(+) => self.overflow_mul(other)!!;
-
-typedef Long = inline long;
-
-fn Long Long.add(self, Long other) @operator(+) => self.overflow_add(other)!!;
-fn Long Long.sub(self, Long other) @operator(+) => self.overflow_sub(other)!!;
-fn Long Long.mul(self, Long other) @operator(+) => self.overflow_mul(other)!!;
-
-typedef Short = inline short;
-
-fn Short Short.add(self, Short other) @operator(+) => self.overflow_add(other)!!;
-fn Short Short.sub(self, Short other) @operator(+) => self.overflow_sub(other)!!;
-fn Short Short.mul(self, Short other) @operator(+) => self.overflow_mul(other)!!;
-
-typedef UInt = inline uint;
-
-fn UInt UInt.add(self, UInt other) @operator(+) => self.overflow_add(other)!!;
-fn UInt UInt.sub(self, UInt other) @operator(+) => self.overflow_sub(other)!!;
-fn UInt UInt.mul(self, UInt other) @operator(+) => self.overflow_mul(other)!!;
-
-typedef ULong = inline ulong;
-
-fn ULong ULong.add(self, ULong other) @operator(+) => self.overflow_add(other)!!;
-fn ULong ULong.sub(self, ULong other) @operator(+) => self.overflow_sub(other)!!;
-fn ULong ULong.mul(self, ULong other) @operator(+) => self.overflow_mul(other)!!;
-
-typedef UShort = inline ushort;
-
-fn UShort UShort.add(self, UShort other) @operator(+) => self.overflow_add(other)!!;
-fn UShort UShort.sub(self, UShort other) @operator(+) => self.overflow_sub(other)!!;
-fn UShort UShort.mul(self, UShort other) @operator(+) => self.overflow_mul(other)!!;
-
-
 
 faultdef
 	NON_AUDIO_FLAC_UNSUPPORTED,
@@ -104,9 +67,10 @@ fn sz? FlacFrame.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_form
 
 struct FlacSubframe (Printable)
 {
-	int wasted_bits;
 	FlacSubframeType type;
 	char predictor_order;
+	char bits_per_sample;
+	char wasted_bits;
 	int[] samples; // TODO: when I do streaming these won't be all the samples, these will only be the last N samples for the predictor to work with, with constant subframes it will be empty or only the last decoded subframe
 }
 fn sz? FlacSubframe.to_format(&self, Formatter* fmt) @dynamic => io::struct_to_format(*self, fmt, false);
@@ -186,22 +150,20 @@ fn FlacDecoder? open(Allocator alloc, String file)
 		}
 	}
 
-	//while (true)
-	for (sz i = 0; i < 9; i++)
+	while (true)
 	{
 		FlacFrame frame = decode_frame(&decoder)!!;
-		//if (frame.channels != STEREO_RIGHT_SIDE) continue;
-		//if (frame.subframes[0].type != LINEAR_PREDICTOR || frame.subframes[1].type != LINEAR_PREDICTOR) continue;
-		log::debug("%s", frame);
+		//log::debug("%s", frame.subframes[0]);
 		if (@unlikely(frame.channels.num_channels != 2)) abort("Tried to output audio with a channel count other than 2");
+		if (@unlikely(frame.sample_rate != 44100)) abort("sample rate not 44.1 kHz");
 		// used to convert each sample into a 32-bit sample so it can be piped into `aplay -t raw -f S32_LE -c2 -r44100`
 		int shift_bits = bitsizeof(int) - frame.bit_depth;
 		$if $feature(PLAY_TO_STDOUT):
 			@each_channel_sample(&frame; int[] channel_samples)
 			{
-				//foreach (sample : channel_samples)
+				foreach (sample : channel_samples)
 				{
-					io::write_le_int(io::stdout(), channel_samples[0] << shift_bits)!!;
+					io::write_le_int(io::stdout(), sample << shift_bits)!!;
 				}
 			};
 		$endif
@@ -409,14 +371,14 @@ fn FlacFrame? decode_frame_header(FlacDecoder* self) @private
 
 fn FlacSubframe? decode_subframe(FlacDecoder* flac, FlacFrame* frame, bool extra_depth_bit = false) @private
 {
-	FlacSubframe subframe = decode_subframe_header(flac)!;
+	FlacSubframe subframe = decode_subframe_header(flac, frame)!;
 	decode_subframe_data(flac, frame, &subframe, extra_depth_bit)!;
 	return subframe;
 }
 
 // A subframe header is not guaranteed to be byte aligned unless it is the first after a frame header so it needs to use the bit reader
 // I need to make sure the bit reader is properly reset after using the regular file reader with something that is guaranteed to be byte aligned so it doesn't re-use old data stored when it was last used
-fn FlacSubframe? decode_subframe_header(FlacDecoder* self) @private
+fn FlacSubframe? decode_subframe_header(FlacDecoder* self, FlacFrame* frame) @private
 {
 	FlacSubframe subframe;
 	// TODO: compact these first 3 read_bits calls into a single read_bits(8) call and do the rest of the bit stuff manually, it should improve performance
@@ -436,8 +398,15 @@ fn FlacSubframe? decode_subframe_header(FlacDecoder* self) @private
 		default: unreachable();
 	}
 
+	subframe.bits_per_sample = frame.bit_depth;
+
 	bool has_wasted_bits = self.bit_reader.read_bits(1)! != 0;
-	if (has_wasted_bits) subframe.wasted_bits = self.bit_reader.read_unary_number(int)! + 1;
+	if (has_wasted_bits)
+	{
+		subframe.wasted_bits = self.bit_reader.read_unary_number(char)! + 1;
+		subframe.bits_per_sample -= subframe.wasted_bits;
+		if (subframe.wasted_bits >= frame.bit_depth) return BAD_FLAC~;
+	}
 
 	log::debug("%s", subframe);
 	//if (has_wasted_bits) abort("TODO: wasted bits are not supported yet");
@@ -501,10 +470,16 @@ fn void? decode_subframe_data(FlacDecoder* self, FlacFrame* frame, FlacSubframe*
 				{
 					prediction += (long)coefficient * subframe.samples[i - (j + 1)];
 				}
-				log::debug("prediction: %s, after: %s", prediction, prediction >> prediction_shift);
 				prediction >>= prediction_shift;
 				subframe.samples[i] = residual.next(self)! + (int)prediction;
 			}
+	}
+	if (subframe.wasted_bits > 0)
+	{
+		foreach (&sample : subframe.samples)
+		{
+			*sample <<= subframe.wasted_bits;
+		}
 	}
 }
 
@@ -517,14 +492,12 @@ fn void? decode_frame_footer(FlacDecoder* self, FlacFrame* frame)
 
 fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, FlacSubframe* subframe, bool extra_depth_bit) @private
 {
-	int bits_remaining = frame.bit_depth - subframe.wasted_bits + (int)extra_depth_bit;
-	log::debug("bit_depth: %s, wasted_bits: %s, bits_remaining: %s", frame.bit_depth, subframe.wasted_bits, bits_remaining);
-	if (@unlikely(bits_remaining <= 0)) return BAD_FLAC~;
+	int bits_remaining = subframe.bits_per_sample + (int)extra_depth_bit;
 	uint res = self.bit_reader.read_more_bits(bits_remaining)!;
-	if (@unlikely(res > int::max || (res << subframe.wasted_bits) > int::max)) abort("correlated side channel resulted in a value over 32 bits, TODO: handle?");
+	//if (@unlikely(res > int::max || (res << subframe.wasted_bits) > int::max)) abort("correlated side channel resulted in a value over 32 bits, TODO: handle?");
 	log::debug("sample before: %s, sample after: %s", res, res << subframe.wasted_bits);
-	res <<= subframe.wasted_bits;
-	int shift_bits = bitsizeof(int) - frame.bit_depth;
+	//res <<= subframe.wasted_bits;
+	int shift_bits = bitsizeof(int) - subframe.bits_per_sample;
 	return (int)(res << shift_bits) >> shift_bits; // sign extend the decoded value
 }
 
@@ -703,8 +676,6 @@ bitstruct FlacFrameHeaderFirstPart : uint/*char[4]*/ @bigendian @private
 
 struct FlacCodedResidualState //@nopadding
 {
-	//char partition_order;
-	int wasted_bits;
 	ushort num_partitions;
 	ushort num_residual_samples;
 	ushort num_first_residual_samples;
@@ -734,7 +705,6 @@ fn void? FlacCodedResidualState.init(&self, FlacDecoder* decoder, FlacFrame* fra
 	new.num_residual_samples = (frame.block_size >> partition_order);
 	new.num_first_residual_samples = new.num_residual_samples - subframe.predictor_order;
 	new.current_partition_sample_num = new.num_residual_samples;
-	new.wasted_bits = subframe.wasted_bits;
 	*self = new;
 
 	if (@unlikely(frame.block_size % new.num_partitions != 0)) return BAD_CODED_RESIDUAL~;
@@ -761,7 +731,7 @@ fn int? FlacCodedResidualState.next(&self, FlacDecoder* decoder)
 	if (self.current_partition_parameter == ESCAPED_PARTITION) // it's an escaped partition with fixed residual sample sizes
 	{
 		if (self.residual_sample_bits == 0) return 0;
-		uint raw_sample = decoder.bit_reader.read_more_bits(self.residual_sample_bits)! << self.wasted_bits;
+		uint raw_sample = decoder.bit_reader.read_more_bits(self.residual_sample_bits)!;
 		int shift_bits = bitsizeof(int) - self.residual_sample_bits;
 		int final_sample = (int)(raw_sample << shift_bits) >> shift_bits; // make use of signed int sign extension when right shifting to sign extend the sample
 		return (int)final_sample;
@@ -771,11 +741,12 @@ fn int? FlacCodedResidualState.next(&self, FlacDecoder* decoder)
 		uint most_significant_part = decoder.bit_reader.read_unary_number(uint)!;
 		uint least_significant_part = self.current_partition_parameter == 0 ? 0 : decoder.bit_reader.read_more_bits(self.current_partition_parameter)!;
 		uint folded_residual = (most_significant_part << self.current_partition_parameter) | least_significant_part;
+
 		// These both get optimised to the same thing so I use the more readable one
 		uint final_sample = folded_residual % 2 == 0 ? (folded_residual >> 1) : ~(folded_residual >> 1);
-		final_sample <<= self.wasted_bits;
-		// uint maybe_invert_mask = -(folded_residual & 0x01);
-		// int final_sample = (int)((folded_residual >> 1) ^ maybe_invert_mask);
+		//uint maybe_invert_mask = -(folded_residual & 0x01);
+		//int final_sample = (int)((folded_residual >> 1) ^ maybe_invert_mask);
+
 		return (int)final_sample;
 	}
 }
