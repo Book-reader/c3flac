@@ -152,13 +152,18 @@ fn FlacDecoder? open(Allocator alloc, String file)
 
 	while (true)
 	{
-		FlacFrame frame = decode_frame(&decoder)!!;
+		FlacFrame? frame = decode_frame(&decoder);
+		if (catch err = frame)
+		{
+			if (err != io::UNEXPECTED_EOF) abort("%s %s", err, file);
+			return decoder;
+		}
 		//log::debug("%s", frame.subframes[0]);
-		if (@unlikely(frame.channels.num_channels != 2)) abort("Tried to output audio with a channel count other than 2");
-		if (@unlikely(frame.sample_rate != 44100)) abort("sample rate not 44.1 kHz");
-		// used to convert each sample into a 32-bit sample so it can be piped into `aplay -t raw -f S32_LE -c2 -r44100`
-		int shift_bits = bitsizeof(int) - frame.bit_depth;
 		$if $feature(PLAY_TO_STDOUT):
+			if (@unlikely(frame.channels.num_channels != 2)) abort("Tried to output audio with a channel count other than 2 (got %s) %s", frame.channels, file);
+			if (@unlikely(frame.sample_rate != 44100)) abort("sample rate not 44.1 kHz");
+			// used to convert each sample into a 32-bit sample so it can be piped into `aplay -t raw -f S32_LE -c2 -r44100`
+			int shift_bits = bitsizeof(int) - frame.bit_depth;
 			@each_channel_sample(&frame; int[] channel_samples)
 			{
 				foreach (sample : channel_samples)
