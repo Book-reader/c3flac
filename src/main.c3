@@ -4,7 +4,9 @@ import flac;
 
 fn int main(String[] args)
 {
-	log::set_priority_all(DEBUG);
+	$if !$feature(NO_DEBUG):
+		log::set_priority_all(DEBUG);
+	$endif
 
 	FlacDecoder f = flac::open(tmem, args[1], {.upscale_to_32bit})!!;
 	defer (void)f.close();
@@ -14,7 +16,7 @@ fn int main(String[] args)
 		if (@unlikely(/*frame.channels.num_channels*/samples.len != 2)) abort("Tried to output audio with a channel count other than 2 (got %%s) %%s"/*, frame.channels, file*/);
 		//if (@unlikely(frame.sample_rate != 44100)) abort("sample rate not 44.1 kHz");
 		// used to convert each sample into a 32-bit sample so it can be piped into `aplay -t raw -f S32_LE -c2 -r44100`
-		int shift_bits = bitsizeof(int) - 16/*frame.bit_depth*/;
+		int shift_bits = bitsizeof(int) - f.flac_info.bits_per_sample/*frame.bit_depth*/;
 		for (sz i = 0; i < samples[0].len; i++)
 		{
 			for (sz j = 0; j < samples.len; j++)
@@ -630,8 +632,10 @@ macro void? FlacDecoder.@next_frame(&self; @body(int[][] samples))
 	if (catch err = frame)
 	{
 		if (err != io::UNEXPECTED_EOF) abort("%s", err);
+		err~!!;
 	}
 	if (self.variable_block_size) abort("TODO: handle variable block size here");
+	if (@unlikely(frame.bit_depth != self.flac_info.bits_per_sample)) abort("The demo program requires all samples to have the same bit depth (on line 17)");
 	@body(self.samples);
 }
 
