@@ -26,4 +26,6 @@ changing the command, and is not a limitation of the library.
   own risk.)
 - This isn't _100%_ spec compliant, it can decode most "regular" flac files,
   but running it on the files in `resources/flac-test-files/` may result in
-  incorrect behaviour for some of them.
+  incorrect behaviour for some of them. It also doesn't support variable
+  block size yet, which I haven't encountered in any files I've tested so far,
+  but should be implemented at some point.
