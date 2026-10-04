@@ -294,7 +294,7 @@ fn void? decode_stereo_mid_side_frame(FlacDecoder* flac, FlacFrame* frame)
 		int mid = mid_channel.samples[i] << 1;
 		int side = side_channel.samples[i];
 		// if (side % 2 == 1) mid += 1;
-		mid += side % 2;
+		mid += side & 1;
 		mid_channel.samples[i] = (mid + side) >> 1; // now the left channel
 		side_channel.samples[i] = (mid - side) >> 1; // now the right channel
 	}
@@ -339,7 +339,7 @@ fn void? decode_stereo_side_right_frame(FlacDecoder* flac, FlacFrame* frame)
 
 macro void @each_channel_sample(FlacFrame* frame; @body(int[] channel_samples))
 {
-	int[FlacFrameChannels.EIGHT.num_channels] vals;
+	int[MAX_CHANNELS] vals;
 
 	for (sz i = 0; i < frame.block_size; i++)
 	{
@@ -567,7 +567,7 @@ fn int? decode_subframe_constant_sample(FlacDecoder* self, FlacFrame* frame, Fla
 	//if (@unlikely(res > int::max || (res << subframe.wasted_bits) > int::max)) abort("correlated side channel resulted in a value over 32 bits, TODO: handle?");
 	log::debug("sample before: %s, sample after: %s", res, res << subframe.wasted_bits);
 	//res <<= subframe.wasted_bits;
-	int shift_bits = bitsizeof(int) - subframe.bits_per_sample;
+	int shift_bits = bitsizeof(int) - bits_remaining;
 	return (int)(res << shift_bits) >> shift_bits; // sign extend the decoded value
 }
 
@@ -660,7 +660,16 @@ macro void? FlacDecoder.@next_frame(&self; @body(int[][] samples))
 	}
 	if (self.variable_block_size) abort("TODO: handle variable block size here");
 	if (@unlikely(frame.bit_depth != self.flac_info.bits_per_sample)) abort("The demo program requires all samples to have the same bit depth (on line 17)");
-	@body(self.samples);
+
+	int[][MAX_CHANNELS] channels;
+
+	// Truncate channels in the block to the correct size (for when a block is smaller than max_block_size, i.e. the last block or with variable_block_size)
+	foreach (i, channel : self.samples)
+	{
+		channels[i] = channel[:frame.block_size];
+	}
+
+	@body(channels[:self.samples.len]);
 }
 
 macro void? FlacDecoder.@each_frame(&self; @body(int[][] samples))
@@ -705,6 +714,7 @@ constdef FlacMetadataHeaderType : char @private
 
 enum FlacFrameBlockSizeType  : char @private {COMMON, UNCOMMON_8, UNCOMMON_16}
 enum FlacFrameSampleRateType : char @private {COMMON, ONLY_STORED_IN_STREAMINFO, UNCOMMON_KHZ_8, UNCOMMON_HZ_16, UNCOMMON_HZ_16_DIV10}
+const MAX_CHANNELS = 8;
 enum FlacFrameChannels : char (char num_channels, bool is_correlated) @private
 {
 	MONO {1, false},
