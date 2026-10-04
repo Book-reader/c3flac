@@ -494,7 +494,7 @@ fn void? decode_subframe_data(FlacDecoder* self, FlacFrame* frame, FlacSubframe*
 			subframe.samples = self.samples[frame.decoded_subframes][:frame.block_size];//alloc::alloc_array(self.alloc, int, frame.block_size);
 			subframe.samples[..] = decode_subframe_constant_sample(self, frame, subframe, extra_depth_bit)!;
 		case VERBATIM:
-			subframe.samples = alloc::alloc_array(self.alloc, int, frame.block_size);
+			subframe.samples = self.samples[frame.decoded_subframes][:frame.block_size];
 			for (sz i = 0; i < subframe.samples.len; i++)
 			{
 				subframe.samples[i] = decode_subframe_constant_sample(self, frame, subframe, extra_depth_bit)!;
