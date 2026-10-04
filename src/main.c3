@@ -37,7 +37,31 @@ fn int main(String[] args)
 module flac;
 import std::io;
 import std::math;
+/*import std::collections::list;
 
+fn int[] FlacDecoder.decode_to_array (&self, Allocator alloc) => @pool ()
+{
+	List {int} samples;
+	samples.tinit ();
+
+	int shift_bits = bitsizeof(int) - self.flac_info.bits_per_sample;
+	// Don't worry about this... it's terrible lmao
+	if (catch err = self.@each_frame(; int[][] raw_samples)
+	{
+		foreach (channel : raw_samples)
+		{
+			foreach (sample : channel)
+			{
+				samples.push (sample << shift_bits);
+			}
+		}
+	})
+	{
+		if (err != io::UNEXPECTED_EOF) err~!!;
+	}
+
+	return samples.to_array (alloc);
+}*/
 
 faultdef
 	NON_AUDIO_FLAC_UNSUPPORTED,
@@ -632,7 +656,7 @@ macro void? FlacDecoder.@next_frame(&self; @body(int[][] samples))
 	if (catch err = frame)
 	{
 		if (err != io::UNEXPECTED_EOF) abort("%s", err);
-		err~!!;
+		return err~;
 	}
 	if (self.variable_block_size) abort("TODO: handle variable block size here");
 	if (@unlikely(frame.bit_depth != self.flac_info.bits_per_sample)) abort("The demo program requires all samples to have the same bit depth (on line 17)");
